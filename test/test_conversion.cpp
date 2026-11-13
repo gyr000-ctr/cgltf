@@ -11,6 +11,26 @@ static bool is_near(cgltf_float a, cgltf_float b)
 	return std::abs(a - b) < 10 * std::numeric_limits<cgltf_float>::min();
 }
 
+/*
+ * The EXPONENTIAL meshopt filter is lossy, so a min/max range computed from the
+ * reconstructed values can differ slightly from the range stored pre-compression.
+ * Everything else decodes exactly and keeps the strict comparison.
+ */
+static bool uses_lossy_meshopt_filter(const cgltf_accessor* accessor)
+{
+	const cgltf_buffer_view* view = accessor->buffer_view;
+	return view && view->has_meshopt_compression &&
+	       view->meshopt_compression.filter == cgltf_meshopt_compression_filter_exponential;
+}
+
+static bool minmax_matches(cgltf_float computed, cgltf_float expected, bool lossy, cgltf_float range)
+{
+	if (!lossy)
+		return is_near(computed, expected);
+	const cgltf_float eps = std::max(1e-5f, 2e-3f * std::abs(range));
+	return std::abs(computed - expected) <= eps;
+}
+
 int main(int argc, char** argv)
 {
 	if (argc < 2)
@@ -28,14 +48,17 @@ int main(int argc, char** argv)
 
 	// Skip files that use mesh compression since they require extra code to decompress accessor data
 	for (size_t i = 0; i < data->extensions_used_count; ++i)
-		if (strcmp(data->extensions_used[i], "KHR_draco_mesh_compression") == 0 || strcmp(data->extensions_used[i], "EXT_meshopt_compression") == 0)
+		if (strcmp(data->extensions_used[i], "KHR_draco_mesh_compression") == 0)
 		{
 			cgltf_free(data);
 			return 0;
 		}
 
 	if (result != cgltf_result_success)
+	{
+		cgltf_free(data);
 		return result;
+	}
 
 	//const cgltf_accessor* blobs = data->accessors;
 	cgltf_float element_float[16];
@@ -49,6 +72,8 @@ int main(int argc, char** argv)
 			cgltf_float* dense = (cgltf_float*) malloc(nfloats * sizeof(cgltf_float));
 			if (cgltf_accessor_unpack_floats(blob, dense, nfloats) < nfloats) {
 				printf("Unable to completely unpack a sparse accessor.\n");
+				free(dense);
+				cgltf_free(data);
 				return -1;
 			}
 			free(dense);
@@ -64,9 +89,13 @@ int main(int argc, char** argv)
 				min0 = std::min(min0, element_float[0]);
 				max0 = std::max(max0, element_float[0]);
 			}
-			if (!is_near(min0, blob->min[0]) || !is_near(max0, blob->max[0]))
+			if (!minmax_matches(min0, blob->min[0], uses_lossy_meshopt_filter(blob),
+					std::max(std::abs(blob->max[0]), std::abs(blob->min[0]))) ||
+			    !minmax_matches(max0, blob->max[0], uses_lossy_meshopt_filter(blob),
+					std::max(std::abs(blob->max[0]), std::abs(blob->min[0]))))
 			{
 				printf("Computed [%f, %f] but expected [%f, %f]\n", min0, max0, blob->min[0], blob->max[0]);
+				cgltf_free(data);
 				return -1;
 			}
 		}
@@ -83,6 +112,7 @@ int main(int argc, char** argv)
 			if ( min0 != (unsigned int) blob->min[0] || max0 != (unsigned int) blob->max[0] )
 			{
 				printf( "Computed [%u, %u] but expected [%u, %u]\n", min0, max0, (unsigned int) blob->min[0], (unsigned int) blob->max[0] );
+				cgltf_free(data);
 				return -1;
 			}
 		}

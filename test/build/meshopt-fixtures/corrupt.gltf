@@ -1,0 +1,25 @@
+{
+ "asset":{"version":"2.0","generator":"meshopt-fixture"},
+ "extensionsUsed":["EXT_meshopt_compression"],"extensionsRequired":["EXT_meshopt_compression"],
+ "buffers":[{"uri":"corrupt.bin","byteLength":2360},{"uri":"ref.bin","byteLength":4272}],
+ "bufferViews":[
+  {"buffer":1,"byteOffset":0,"byteLength":1152,"byteStride":12,"target":34962,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":0,"byteLength":945,"byteStride":12,"mode":"ATTRIBUTES","count":96}}},
+  {"buffer":1,"byteOffset":1152,"byteLength":768,"byteStride":8,"target":34962,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":948,"byteLength":337,"byteStride":8,"mode":"ATTRIBUTES","filter":"OCTAHEDRAL","count":96}}},
+  {"buffer":1,"byteOffset":1920,"byteLength":768,"byteStride":8,"target":34962,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":1288,"byteLength":374,"byteStride":8,"mode":"ATTRIBUTES","filter":"QUATERNION","count":96}}},
+  {"buffer":1,"byteOffset":2688,"byteLength":768,"byteStride":8,"target":34962,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":1664,"byteLength":351,"byteStride":8,"mode":"ATTRIBUTES","filter":"EXPONENTIAL","count":96}}},
+  {"buffer":1,"byteOffset":3456,"byteLength":384,"byteStride":4,"target":34962,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":2016,"byteLength":211,"byteStride":4,"mode":"ATTRIBUTES","filter":"COLOR","count":96}}},
+  {"buffer":1,"byteOffset":3840,"byteLength":144,"target":34963,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":2228,"byteLength":41,"byteStride":2,"mode":"TRIANGLES","count":72}}},
+  {"buffer":1,"byteOffset":3984,"byteLength":288,"target":34963,"extensions":{"EXT_meshopt_compression":{"buffer":0,"byteOffset":2272,"byteLength":85,"byteStride":4,"mode":"INDICES","count":72}}}
+ ],
+ "accessors":[
+  {"name":"POSITION","bufferView":0,"componentType":5126,"count":96,"type":"VEC3"},
+  {"name":"NORMAL","bufferView":1,"componentType":5122,"count":96,"type":"VEC3","normalized":true},
+  {"name":"ROTATION","bufferView":2,"componentType":5122,"count":96,"type":"VEC4","normalized":true},
+  {"name":"TEXCOORD_0","bufferView":3,"componentType":5126,"count":96,"type":"VEC2"},
+  {"name":"COLOR_0","bufferView":4,"componentType":5121,"count":96,"type":"VEC4","normalized":true},
+  {"name":"indices16","bufferView":5,"componentType":5123,"count":72,"type":"SCALAR"},
+  {"name":"indices32","bufferView":6,"componentType":5125,"count":72,"type":"SCALAR"}
+ ],
+ "meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1,"ROTATION":2,"TEXCOORD_0":3,"COLOR_0":4},"indices":5,"material":0}],"extras":{"seq":6}}],
+ "materials":[{}]
+}

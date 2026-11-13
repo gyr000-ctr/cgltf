@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcgltf_meshopt.a CMakeFiles/cgltf_meshopt.dir/home/gyr/feedback/uid5205/third_party/meshoptimizer/cgltf_meshopt.cpp.o CMakeFiles/cgltf_meshopt.dir/home/gyr/feedback/uid5205/third_party/meshoptimizer/vertexcodec.cpp.o CMakeFiles/cgltf_meshopt.dir/home/gyr/feedback/uid5205/third_party/meshoptimizer/indexcodec.cpp.o CMakeFiles/cgltf_meshopt.dir/home/gyr/feedback/uid5205/third_party/meshoptimizer/vertexfilter.cpp.o
+/usr/bin/ranlib libcgltf_meshopt.a

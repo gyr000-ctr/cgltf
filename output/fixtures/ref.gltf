@@ -1,0 +1,24 @@
+ {
+ "asset":{"version":"2.0","generator":"meshopt-fixture"},
+ "buffers":[{"uri":"ref.bin","byteLength":4272}],
+ "bufferViews":[
+  {"buffer":0,"byteOffset":0,"byteLength":1152,"byteStride":12,"target":34962},
+  {"buffer":0,"byteOffset":1152,"byteLength":768,"byteStride":8,"target":34962},
+  {"buffer":0,"byteOffset":1920,"byteLength":768,"byteStride":8,"target":34962},
+  {"buffer":0,"byteOffset":2688,"byteLength":768,"byteStride":8,"target":34962},
+  {"buffer":0,"byteOffset":3456,"byteLength":384,"byteStride":4,"target":34962},
+  {"buffer":0,"byteOffset":3840,"byteLength":144,"target":34963},
+  {"buffer":0,"byteOffset":3984,"byteLength":288,"target":34963}
+ ],
+ "accessors":[
+  {"name":"POSITION","bufferView":0,"componentType":5126,"count":96,"type":"VEC3"},
+  {"name":"NORMAL","bufferView":1,"componentType":5122,"count":96,"type":"VEC3","normalized":true},
+  {"name":"ROTATION","bufferView":2,"componentType":5122,"count":96,"type":"VEC4","normalized":true},
+  {"name":"TEXCOORD_0","bufferView":3,"componentType":5126,"count":96,"type":"VEC2"},
+  {"name":"COLOR_0","bufferView":4,"componentType":5121,"count":96,"type":"VEC4","normalized":true},
+  {"name":"indices16","bufferView":5,"componentType":5123,"count":72,"type":"SCALAR"},
+  {"name":"indices32","bufferView":6,"componentType":5125,"count":72,"type":"SCALAR"}
+ ],
+ "meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1,"ROTATION":2,"TEXCOORD_0":3,"COLOR_0":4},"indices":5,"material":0}],"extras":{"seq":6}}],
+ "materials":[{}]
+}

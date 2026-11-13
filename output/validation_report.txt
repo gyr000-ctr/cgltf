@@ -1,0 +1,6 @@
+meshopt decode validation - 2026-11-13T08:38:14Z
+[unit] test_math / test_strings / test_meshopt: PASS
+[fixtures] gen_meshopt_fixtures: 7 streams, ref=4272B compressed=2360B
+[real models] BrainStem + DragonAttenuation (EXT_meshopt), gltfpack GLB, KHR-named variant: PASS
+[error codes] unsupported=10 (decoder absent), invalid_compressed_data=11 (corrupt), data_too_short distinct
+[regression] test_all.py: 726 sample files, 0 errors

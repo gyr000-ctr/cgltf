@@ -100,7 +100,7 @@ cgltf supports core glTF 2.0:
 
 cgltf also supports some glTF extensions:
 - EXT_mesh_gpu_instancing
-- EXT_meshopt_compression
+- EXT_meshopt_compression / KHR_meshopt_compression (decoding supported, see below)
 - EXT_texture_webp
 - KHR_draco_mesh_compression (requires a library like [Google's Draco](https://github.com/google/draco) for decompression though)
 - KHR_lights_punctual
@@ -122,6 +122,27 @@ cgltf also supports some glTF extensions:
 - KHR_texture_transform
 
 cgltf does **not** yet support unlisted extensions. However, unlisted extensions can be accessed via "extensions" member on objects.
+
+### Meshopt compression (EXT/KHR_meshopt_compression)
+
+Parsing the extension declarations is built into `cgltf.h`; the actual decompression lives in a
+separate, optional C-ABI layer (`third_party/meshoptimizer/cgltf_meshopt.cpp`, built on the
+MIT-licensed [meshoptimizer](https://github.com/zeux/meshoptimizer) decoder). cgltf reaches it
+through a single weak function pointer, `cgltf_meshopt_decode_hook`, so no accessor-parsing code is
+duplicated: decoded bytes are placed in the existing `cgltf_buffer_view::data` field and every read
+(`cgltf_buffer_view_data`, `cgltf_accessor_read_float/uint/int`, `cgltf_accessor_unpack_floats`,
+sparse accessors) goes through the same entry points as for uncompressed files.
+
+Link the objects from `third_party/meshoptimizer/` into your target (the CMake setup under `test/`
+shows how) to enable decoding. If the layer is not linked, or `CGLTF_MESHOPT_DECODE` is defined to
+`0`, `cgltf_load_buffers` fails with a distinct result instead of returning undecoded vertices:
+
+- `cgltf_result_unsupported_extension` — no decoder is available for the extension.
+- `cgltf_result_invalid_compressed_data` — a decoder is present but the bitstream is corrupt or
+  truncated.
+- `cgltf_result_data_too_short` — the compressed byte range exceeds its buffer.
+
+Files without the extension are untouched and decode byte-for-byte identically.
 
 ## Building
 The easiest approach is to integrate the `cgltf.h` header file into your project. If you are unfamiliar with single-file C libraries (also known as stb-style libraries), this is how it goes:
@@ -163,3 +184,14 @@ Here's one way to build and run the test:
     ./test_all.py
 
 There is also a llvm-fuzz test in `fuzz/`. See http://llvm.org/docs/LibFuzzer.html for more information.
+
+The meshopt decoder has its own end-to-end test (`test_meshopt`). `gen_meshopt_fixtures` produces a
+matched pair of glTF files (an uncompressed reference and an `EXT_meshopt_compression` version) using
+the reference meshoptimizer encoder; the test then verifies through the public cgltf API that decoded
+attributes and indices match the reference element-by-element, that plain files stay byte-identical,
+and that truncated/corrupt streams and disabled decoders return the distinct error codes above. The
+`run_meshopt_tests` CMake target builds the fixtures and runs the checks:
+
+    cd test ; mkdir build ; cd build ; cmake .. -DCMAKE_BUILD_TYPE=Debug
+    make run_meshopt_tests
+

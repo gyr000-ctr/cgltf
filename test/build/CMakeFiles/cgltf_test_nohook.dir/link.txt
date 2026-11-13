@@ -1,0 +1,1 @@
+/usr/bin/cc -g -fsanitize=address -Wl,--dependency-file=CMakeFiles/cgltf_test_nohook.dir/link.d CMakeFiles/cgltf_test_nohook.dir/main.c.o -o cgltf_test_nohook

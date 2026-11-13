@@ -128,6 +128,8 @@ typedef enum cgltf_result
 	cgltf_result_io_error,
 	cgltf_result_out_of_memory,
 	cgltf_result_legacy_gltf,
+	cgltf_result_unsupported_extension,       /* A used extension has no decoder available (e.g. meshopt support compiled out). */
+	cgltf_result_invalid_compressed_data,     /* Extension data failed to decode (corrupt or truncated stream). */
     cgltf_result_max_enum
 } cgltf_result;
 
@@ -861,6 +863,51 @@ cgltf_result cgltf_load_buffers(
 
 cgltf_result cgltf_load_buffer_base64(const cgltf_options* options, cgltf_size size, const char* base64, void** out_data);
 
+/*
+ * KHR_meshopt_compression / EXT_meshopt_compression decoding hook.
+ *
+ * cgltf itself only parses the extension declarations; the actual decoding lives in
+ * cgltf_meshopt.cpp (a small C-ABI layer on top of the meshoptimizer library) and is
+ * attached through this weak symbol. If the layer is not linked in, the pointer is NULL
+ * and cgltf_load_buffers reports cgltf_result_unsupported_extension instead of handing
+ * out undecoded data. Define CGLTF_MESHOPT_DECODE 0 to disable the pass entirely.
+ */
+#ifndef CGLTF_MESHOPT_DECODE
+#define CGLTF_MESHOPT_DECODE 1
+#endif
+
+typedef enum cgltf_meshopt_decode_status
+{
+	cgltf_meshopt_decode_status_ok = 0,
+	cgltf_meshopt_decode_status_unsupported, /* unknown mode/filter for the available decoder */
+	cgltf_meshopt_decode_status_corrupt,     /* the stream failed to decode (truncated/bad data) */
+	cgltf_meshopt_decode_status_out_of_memory,
+	cgltf_meshopt_decode_status_max_enum
+} cgltf_meshopt_decode_status;
+
+typedef cgltf_meshopt_decode_status (*cgltf_meshopt_decode_fn)(
+		const cgltf_memory_options* memory,
+		cgltf_meshopt_compression_mode mode,
+		cgltf_meshopt_compression_filter filter,
+		cgltf_size stride,
+		cgltf_size count,
+		const uint8_t* compressed,
+		cgltf_size compressed_size,
+		void** out_decoded); /* allocated through `memory`; ownership transfers to cgltf */
+
+#if defined(__GNUC__) || defined(__clang__)
+#define CGLTF_WEAK __attribute__((weak))
+#else
+#define CGLTF_WEAK
+#endif
+
+/*
+ * The declaration is a normal (strong) external reference; only the in-header
+ * fallback definition below is weak, so a decoder linked in by the application
+ * always overrides it.
+ */
+extern cgltf_meshopt_decode_fn cgltf_meshopt_decode_hook;
+
 cgltf_size cgltf_decode_string(char* string);
 cgltf_size cgltf_decode_uri(char* uri);
 
@@ -1010,6 +1057,21 @@ static const uint32_t GlbMagicBinChunk = 0x004E4942;
 #endif
 #ifndef CGLTF_VALIDATE_ENABLE_ASSERTS
 #define CGLTF_VALIDATE_ENABLE_ASSERTS 0
+#endif
+
+/*
+ * Weak default: NULL unless cgltf_meshopt.cpp (or another decoder) is linked in.
+ * On toolchains without weak-symbol support there is no in-header definition, so
+ * the adapter's strong symbol is required at link time.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+	#ifdef __cplusplus
+extern "C" {
+	#endif
+CGLTF_WEAK cgltf_meshopt_decode_fn cgltf_meshopt_decode_hook = 0;
+	#ifdef __cplusplus
+}
+	#endif
 #endif
 
 static void* cgltf_default_alloc(void* user, cgltf_size size)
@@ -1480,6 +1542,94 @@ cgltf_size cgltf_decode_uri(char* uri)
 	return write - uri;
 }
 
+/*
+ * Decodes every buffer view carrying a KHR/EXT_meshopt_compression extension.
+ * Decoded bytes are stored in the existing cgltf_buffer_view::data slot, so every
+ * accessor entry point (cgltf_buffer_view_data / cgltf_accessor_read_* / unpack /
+ * sparse) keeps going through the same code path as for uncompressed files.
+ */
+static cgltf_result cgltf_decode_meshopt_views(cgltf_data* data)
+{
+	cgltf_bool any_compressed = 0;
+	for (cgltf_size i = 0; i < data->buffer_views_count; ++i)
+		any_compressed |= data->buffer_views[i].has_meshopt_compression;
+
+	if (!any_compressed)
+	{
+		return cgltf_result_success;
+	}
+
+#if !CGLTF_MESHOPT_DECODE
+	return cgltf_result_unsupported_extension;
+#else
+	/*
+	 * On GCC/Clang the hook is a weak symbol (NULL when the decoder isn't linked in).
+	 * On other toolchains cgltf_meshopt.cpp provides a regular strong definition, so
+	 * a link error there makes the missing dependency explicit instead of failing silently.
+	 */
+	if (cgltf_meshopt_decode_hook == NULL)
+	{
+		return cgltf_result_unsupported_extension;
+	}
+
+	for (cgltf_size i = 0; i < data->buffer_views_count; ++i)
+	{
+		cgltf_buffer_view* view = &data->buffer_views[i];
+		if (!view->has_meshopt_compression)
+		{
+			continue;
+		}
+
+		cgltf_meshopt_compression* mc = &view->meshopt_compression;
+
+		/* cgltf_validate() checks these too, but load_buffers must be safe on its own. */
+		if (mc->buffer == NULL || mc->buffer->data == NULL || mc->buffer->size < mc->offset + mc->size)
+		{
+			return cgltf_result_data_too_short;
+		}
+		if (mc->stride != 0 && mc->count > SIZE_MAX / mc->stride)
+		{
+			return cgltf_result_out_of_memory;
+		}
+
+		const uint8_t* compressed = (const uint8_t*)mc->buffer->data + mc->offset;
+		void* decoded = NULL;
+		/*
+		 * data->memory holds the fixup'd callbacks (the user-facing options may have
+		 * NULL alloc/free, which cgltf_parse replaces with the default allocator);
+		 * cgltf_free() releases view->data through these same callbacks.
+		 */
+		cgltf_meshopt_decode_status status = cgltf_meshopt_decode_hook(
+				&data->memory,
+				mc->mode, mc->filter, mc->stride, mc->count,
+				compressed, mc->size, &decoded);
+
+		if (status != cgltf_meshopt_decode_status_ok)
+		{
+			data->memory.free_func(data->memory.user_data, decoded);
+			if (status == cgltf_meshopt_decode_status_out_of_memory)
+			{
+				return cgltf_result_out_of_memory;
+			}
+			if (status == cgltf_meshopt_decode_status_unsupported)
+			{
+				return cgltf_result_unsupported_extension;
+			}
+			return cgltf_result_invalid_compressed_data;
+		}
+
+		/*
+		 * The decoded view is now self-contained: cgltf_buffer_view_data() prefers
+		 * view->data over the backing buffer, and the accessor's own byte offset still
+		 * applies on top (compressed views in the spec carry one tightly packed stream).
+		 */
+		view->data = decoded;
+	}
+
+	return cgltf_result_success;
+#endif
+}
+
 cgltf_result cgltf_load_buffers(const cgltf_options* options, cgltf_data* data, const char* gltf_path)
 {
 	if (options == NULL)
@@ -1547,7 +1697,7 @@ cgltf_result cgltf_load_buffers(const cgltf_options* options, cgltf_data* data, 
 		}
 	}
 
-	return cgltf_result_success;
+	return cgltf_decode_meshopt_views(data);
 }
 
 static cgltf_size cgltf_calc_index_bound(cgltf_buffer_view* buffer_view, cgltf_size offset, cgltf_component_type component_type, cgltf_size count)

@@ -1,0 +1,138 @@
+{
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 510
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 510
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5120,
+      "type": "VEC4",
+      "count": 510
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5122,
+      "type": "VEC4",
+      "count": 510
+    },
+    {
+      "bufferView": 4,
+      "componentType": 5122,
+      "type": "VEC4",
+      "count": 510
+    },
+    {
+      "bufferView": 5,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 510
+    },
+    {
+      "bufferView": 6,
+      "componentType": 5121,
+      "type": "VEC4",
+      "count": 510
+    },
+    {
+      "bufferView": 7,
+      "componentType": 5123,
+      "type": "VEC4",
+      "count": 510
+    },
+    {
+      "bufferView": 8,
+      "componentType": 5123,
+      "type": "SCALAR",
+      "count": 510
+    },
+    {
+      "bufferView": 9,
+      "componentType": 5125,
+      "type": "SCALAR",
+      "count": 128
+    }
+  ],
+  "asset": {
+    "generator": "meshopt-cgltf-test",
+    "version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteLength": 6120,
+      "byteStride": 12
+    },
+    {
+      "buffer": 0,
+      "byteLength": 8160,
+      "byteOffset": 6120,
+      "byteStride": 16
+    },
+    {
+      "buffer": 0,
+      "byteLength": 2040,
+      "byteOffset": 14280,
+      "byteStride": 4
+    },
+    {
+      "buffer": 0,
+      "byteLength": 4080,
+      "byteOffset": 16320,
+      "byteStride": 8
+    },
+    {
+      "buffer": 0,
+      "byteLength": 4080,
+      "byteOffset": 20400,
+      "byteStride": 8
+    },
+    {
+      "buffer": 0,
+      "byteLength": 6120,
+      "byteOffset": 24480,
+      "byteStride": 12
+    },
+    {
+      "buffer": 0,
+      "byteLength": 2040,
+      "byteOffset": 30600,
+      "byteStride": 4
+    },
+    {
+      "buffer": 0,
+      "byteLength": 4080,
+      "byteOffset": 32640,
+      "byteStride": 8
+    },
+    {
+      "buffer": 0,
+      "byteLength": 1020,
+      "byteOffset": 36720,
+      "byteStride": 2
+    },
+    {
+      "buffer": 0,
+      "byteLength": 512,
+      "byteOffset": 37740,
+      "byteStride": 4
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 38252
+    },
+    {
+      "uri": "compressed.bin",
+      "byteLength": 30055
+    }
+  ]
+}

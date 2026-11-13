@@ -1,0 +1,41 @@
+
+[1;36m==== 1/7  Strict compile of the modified single header (C99 / C++11 / C++17, -Werror) ====[0m
+strict compiles: OK
+
+[1;36m==== 2/7  Build reference meshoptimizer (pure scalar) and the authoritative test data ====[0m
+generated 10 views, raw=38252 bytes, encoded=30055 bytes
+
+[1;36m==== 3/7  Build the verification harness (ASan + UBSan, no libm linkage) ====[0m
+harness built without -lm
+
+[1;36m==== 4/7  Byte-exact decode: reference glTF vs EXT_meshopt_compression glTF ====[0m
+Result: 0
+Result: 0
+BYTE-EXACT MATCH across all 10 views (all modes + all filters)
+
+[1;36m==== 5/7  Distinguishable error codes for unsupported / corrupt inputs ====[0m
+[PASS] truncated_blob               result=7 (io_error) expected=[4, 7, 11]
+[PASS] bad_vertex_magic             result=11 (decode_error) expected=[11]
+[PASS] bad_index_magic              result=11 (decode_error) expected=[11]
+[PASS] scrambled_stream_tails       result=11 (decode_error) expected=[4, 11]
+[PASS] unknown_required_extension   result=10 (unsupported_extension) expected=[10]
+[PASS] khr_extension_variant        result=0 (success) expected=[0]
+[PASS] clean_reference.gltf       result=0
+[PASS] clean_compressed.gltf      result=0
+wrote valid.glb and corrupt.glb to /tmp/meshopt_corrupt_2vvlw_zl/glb
+[PASS] glb_valid.glb        result=0 (success) expected=0
+[PASS] glb_corrupt.glb      result=11 (decode_error) expected=11
+ALL ERROR CASES PASSED
+
+[1;36m==== 6/7  Zero regression on real uncompressed Khronos sample models (baseline vs modified) ====[0m
+IDENTICAL  Box.gltf
+IDENTICAL  BoxTextured.gltf
+IDENTICAL  TriangleWithoutIndices.gltf
+IDENTICAL  Box.glb
+IDENTICAL  BoxTextured.glb
+ZERO REGRESSION confirmed
+
+[1;36m==== 7/7  Mutation fuzz of the decode path under ASan/UBSan ====[0m
+iters=10000 crashes=0 result_hist={0: 2041, 1: 5299, 2: 1, 3: 267, 4: 29, 10: 4, 11: 2359}
+
+[1;36m==== ALL VERIFICATION COMPLETE ====[0m

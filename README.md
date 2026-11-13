@@ -100,7 +100,7 @@ cgltf supports core glTF 2.0:
 
 cgltf also supports some glTF extensions:
 - EXT_mesh_gpu_instancing
-- EXT_meshopt_compression
+- EXT_meshopt_compression (parsing and built-in bitstream decoding)
 - EXT_texture_webp
 - KHR_draco_mesh_compression (requires a library like [Google's Draco](https://github.com/google/draco) for decompression though)
 - KHR_lights_punctual
@@ -108,6 +108,7 @@ cgltf also supports some glTF extensions:
 - KHR_materials_clearcoat
 - KHR_materials_diffuse_transmission
 - KHR_materials_dispersion
+- KHR_meshopt_compression (parsing and built-in bitstream decoding)
 - KHR_materials_emissive_strength
 - KHR_materials_ior
 - KHR_materials_iridescence

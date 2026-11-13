@@ -1,0 +1,1020 @@
+diff --git a/README.md b/README.md
+index e647ecb..2c07a6e 100644
+--- a/README.md
++++ b/README.md
+@@ -100,7 +100,7 @@ cgltf supports core glTF 2.0:
+ 
+ cgltf also supports some glTF extensions:
+ - EXT_mesh_gpu_instancing
+-- EXT_meshopt_compression
++- EXT_meshopt_compression (parsing and built-in bitstream decoding)
+ - EXT_texture_webp
+ - KHR_draco_mesh_compression (requires a library like [Google's Draco](https://github.com/google/draco) for decompression though)
+ - KHR_lights_punctual
+@@ -108,6 +108,7 @@ cgltf also supports some glTF extensions:
+ - KHR_materials_clearcoat
+ - KHR_materials_diffuse_transmission
+ - KHR_materials_dispersion
++- KHR_meshopt_compression (parsing and built-in bitstream decoding)
+ - KHR_materials_emissive_strength
+ - KHR_materials_ior
+ - KHR_materials_iridescence
+diff --git a/cgltf.h b/cgltf.h
+index 316a11d..94f5c8b 100644
+--- a/cgltf.h
++++ b/cgltf.h
+@@ -38,7 +38,12 @@
+  * const char* gltf_path)` can be optionally called to open and read buffer
+  * files using the `FILE*` APIs. The `gltf_path` argument is the path to
+  * the original glTF file, which allows the parser to resolve the path to
+- * buffer files.
++ * buffer files. Buffer views using EXT_meshopt_compression or
++ * KHR_meshopt_compression are decoded here as well; the decoded bytes are
++ * exposed through `cgltf_buffer_view_data` like any other view. A malformed
++ * compressed stream returns `cgltf_result_decode_error`, and an unsupported
++ * meshopt-family extension returns `cgltf_result_unsupported_extension`, so a
++ * caller never silently receives incorrect vertices.
+  *
+  * `cgltf_result cgltf_load_buffer_base64(const cgltf_options* options,
+  * cgltf_size size, const char* base64, void** out_data)` decodes
+@@ -128,6 +133,8 @@ typedef enum cgltf_result
+ 	cgltf_result_io_error,
+ 	cgltf_result_out_of_memory,
+ 	cgltf_result_legacy_gltf,
++	cgltf_result_unsupported_extension, /* A required extension is not supported (e.g. an unknown meshopt compression mode/filter) */
++	cgltf_result_decode_error, /* Compressed extension data is malformed and can not be decoded */
+     cgltf_result_max_enum
+ } cgltf_result;
+ 
+@@ -1480,6 +1487,949 @@ cgltf_size cgltf_decode_uri(char* uri)
+ 	return write - uri;
+ }
+ 
++/*
++ * KHR_meshopt_compression / EXT_meshopt_compression decoder.
++ *
++ * Scalar C99 port of the reference bitstream decoder from the meshoptimizer
++ * library (vertex/index codecs version 0..1 and the post-decode filters).
++ * Every compressed buffer view is decoded into the view's data pointer, which
++ * is the single entry point (cgltf_buffer_view_data) used by all accessor
++ * reads, so the existing accessor paths are shared and not duplicated.
++ */
++
++#define CGLTF_MESHOPT_VERTEX_HEADER 0xa0
++#define CGLTF_MESHOPT_INDEX_HEADER 0xe0
++#define CGLTF_MESHOPT_SEQUENCE_HEADER 0xd0
++#define CGLTF_MESHOPT_VERTEX_VERSION 1
++#define CGLTF_MESHOPT_INDEX_VERSION 1
++#define CGLTF_MESHOPT_VERTEX_BLOCK_SIZE_BYTES 8192
++#define CGLTF_MESHOPT_VERTEX_BLOCK_MAX_SIZE 256
++#define CGLTF_MESHOPT_BYTE_GROUP_SIZE 16
++#define CGLTF_MESHOPT_BYTE_GROUP_DECODE_LIMIT 24
++#define CGLTF_MESHOPT_TAIL_MIN_SIZE_V0 32
++#define CGLTF_MESHOPT_TAIL_MIN_SIZE_V1 24
++
++static uint32_t cgltf_meshopt_rotate(uint32_t v, int r)
++{
++	return (v << r) | (v >> ((32 - r) & 31));
++}
++
++static cgltf_size cgltf_meshopt_get_vertex_block_size(cgltf_size vertex_size)
++{
++	/* the block size is part of the bitstream format and must stay fixed */
++	cgltf_size result = (CGLTF_MESHOPT_VERTEX_BLOCK_SIZE_BYTES / vertex_size) & ~(CGLTF_MESHOPT_BYTE_GROUP_SIZE - 1);
++
++	return (result < CGLTF_MESHOPT_VERTEX_BLOCK_MAX_SIZE) ? result : CGLTF_MESHOPT_VERTEX_BLOCK_MAX_SIZE;
++}
++
++/* Reads one 16-byte group encoded with the given bit width (0, 1, 2, 4 or 8). */
++static const uint8_t* cgltf_meshopt_decode_bytes_group(const uint8_t* data, uint8_t* buffer, int bits)
++{
++#define CGLTF_MESHOPT_READ() byte = *data++
++#define CGLTF_MESHOPT_NEXT(bits) enc = byte >> (8 - (bits)), byte <<= (bits), encv = *data_var, *buffer++ = (enc == (1 << (bits)) - 1) ? encv : enc, data_var += (enc == (1 << (bits)) - 1)
++
++	uint8_t byte, enc, encv;
++	const uint8_t* data_var;
++
++	switch (bits)
++	{
++	case 0:
++		memset(buffer, 0, CGLTF_MESHOPT_BYTE_GROUP_SIZE);
++		return data;
++	case 1:
++		data_var = data + 2;
++
++		/* 2 groups with 8 1-bit values in each byte (reversed bit order) */
++		CGLTF_MESHOPT_READ();
++		byte = (uint8_t)(((byte * 0x80200802ull) & 0x0884422110ull) * 0x0101010101ull >> 32);
++		CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1),
++			CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1);
++		CGLTF_MESHOPT_READ();
++		byte = (uint8_t)(((byte * 0x80200802ull) & 0x0884422110ull) * 0x0101010101ull >> 32);
++		CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1),
++			CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1), CGLTF_MESHOPT_NEXT(1);
++
++		return data_var;
++	case 2:
++		data_var = data + 4;
++
++		/* 4 groups with 4 2-bit values in each byte */
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2), CGLTF_MESHOPT_NEXT(2);
++
++		return data_var;
++	case 4:
++		data_var = data + 8;
++
++		/* 8 groups with 2 4-bit values in each byte */
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++		CGLTF_MESHOPT_READ(), CGLTF_MESHOPT_NEXT(4), CGLTF_MESHOPT_NEXT(4);
++
++		return data_var;
++	case 8:
++		memcpy(buffer, data, CGLTF_MESHOPT_BYTE_GROUP_SIZE);
++		return data + CGLTF_MESHOPT_BYTE_GROUP_SIZE;
++	default:
++		return NULL;
++	}
++
++#undef CGLTF_MESHOPT_READ
++#undef CGLTF_MESHOPT_NEXT
++}
++
++static const uint8_t* cgltf_meshopt_decode_bytes(const uint8_t* data, const uint8_t* data_end,
++	uint8_t* buffer, cgltf_size buffer_size, const int* bits)
++{
++	/* round the number of groups up to sets of 4 to get the header size */
++	cgltf_size header_size = (buffer_size / CGLTF_MESHOPT_BYTE_GROUP_SIZE + 3) / 4;
++	if ((cgltf_size)(data_end - data) < header_size)
++		return NULL;
++
++	const uint8_t* header = data;
++	data += header_size;
++
++	for (cgltf_size i = 0; i < buffer_size; i += CGLTF_MESHOPT_BYTE_GROUP_SIZE)
++	{
++		if ((cgltf_size)(data_end - data) < CGLTF_MESHOPT_BYTE_GROUP_DECODE_LIMIT)
++			return NULL;
++
++		cgltf_size header_offset = i / CGLTF_MESHOPT_BYTE_GROUP_SIZE;
++		int bitsk = (header[header_offset / 4] >> ((header_offset % 4) * 2)) & 3;
++
++		data = cgltf_meshopt_decode_bytes_group(data, buffer + i, bits[bitsk]);
++		if (data == NULL)
++			return NULL;
++	}
++
++	return data;
++}
++
++/* Undo delta coding for one 4-byte channel made of 1-, 2- or 4-byte components. */
++static void cgltf_meshopt_decode_deltas_4(const uint8_t* buffer, uint8_t* transposed,
++	cgltf_size vertex_count, cgltf_size vertex_size, const uint8_t* last_vertex, int component_size, int xor_rotate, int rot)
++{
++	for (cgltf_size k = 0; k < 4; k += component_size)
++	{
++		cgltf_size vertex_offset = k;
++
++		uint32_t p = 0;
++		for (cgltf_size j = 0; j < (cgltf_size)component_size; ++j)
++			p |= (uint32_t)last_vertex[j] << (8 * j);
++
++		for (cgltf_size i = 0; i < vertex_count; ++i)
++		{
++			uint32_t v = 0;
++			for (cgltf_size j = 0; j < (cgltf_size)component_size; ++j)
++				v |= (uint32_t)buffer[i + vertex_count * j] << (8 * j);
++
++			if (xor_rotate)
++				v = cgltf_meshopt_rotate(v, rot) ^ p;
++			else
++			{
++				/* unzigzag: (0 - (v & 1)) ^ (v >> 1), truncated to the component width */
++				uint32_t mask = component_size == 1 ? 0xffu : (component_size == 2 ? 0xffffu : 0xffffffffu);
++				v = (((0 - (v & 1)) ^ (v >> 1)) & mask) + p;
++			}
++
++			for (cgltf_size j = 0; j < (cgltf_size)component_size; ++j)
++				transposed[vertex_offset + j] = (uint8_t)(v >> (j * 8));
++
++			p = v;
++			vertex_offset += vertex_size;
++		}
++
++		buffer += vertex_count * component_size;
++		last_vertex += component_size;
++	}
++}
++
++static const uint8_t* cgltf_meshopt_decode_vertex_block(const uint8_t* data, const uint8_t* data_end,
++	uint8_t* vertex_data, cgltf_size vertex_count, cgltf_size vertex_size,
++	uint8_t last_vertex[256], const uint8_t* channels, int version)
++{
++	uint8_t buffer[CGLTF_MESHOPT_VERTEX_BLOCK_MAX_SIZE * 4];
++	uint8_t transposed[CGLTF_MESHOPT_VERTEX_BLOCK_SIZE_BYTES];
++
++	cgltf_size vertex_count_aligned = (vertex_count + CGLTF_MESHOPT_BYTE_GROUP_SIZE - 1) & ~(CGLTF_MESHOPT_BYTE_GROUP_SIZE - 1);
++
++	cgltf_size control_size = version == 0 ? 0 : vertex_size / 4;
++	if ((cgltf_size)(data_end - data) < control_size)
++		return NULL;
++
++	const uint8_t* control = data;
++	data += control_size;
++
++	static const int bits_v0[4] = {0, 2, 4, 8};
++	static const int bits_v1[5] = {0, 1, 2, 4, 8};
++
++	for (cgltf_size k = 0; k < vertex_size; k += 4)
++	{
++		uint8_t ctrl_byte = version == 0 ? 0 : control[k / 4];
++
++		for (cgltf_size j = 0; j < 4; ++j)
++		{
++			int ctrl = (ctrl_byte >> (j * 2)) & 3;
++
++			if (ctrl == 3)
++			{
++				/* literal encoding */
++				if ((cgltf_size)(data_end - data) < vertex_count)
++					return NULL;
++
++				memcpy(buffer + j * vertex_count, data, vertex_count);
++				data += vertex_count;
++			}
++			else if (ctrl == 2)
++			{
++				/* zero encoding */
++				memset(buffer + j * vertex_count, 0, vertex_count);
++			}
++			else
++			{
++				const int* bits = version == 0 ? bits_v0 : bits_v1 + ctrl;
++				data = cgltf_meshopt_decode_bytes(data, data_end, buffer + j * vertex_count, vertex_count_aligned, bits);
++				if (data == NULL)
++					return NULL;
++			}
++		}
++
++		int channel = version == 0 ? 0 : channels[k / 4];
++
++		switch (channel & 3)
++		{
++		case 0:
++			cgltf_meshopt_decode_deltas_4(buffer, transposed + k, vertex_count, vertex_size, last_vertex + k, 1, 0, 0);
++			break;
++		case 1:
++			cgltf_meshopt_decode_deltas_4(buffer, transposed + k, vertex_count, vertex_size, last_vertex + k, 2, 0, 0);
++			break;
++		case 2:
++			cgltf_meshopt_decode_deltas_4(buffer, transposed + k, vertex_count, vertex_size, last_vertex + k, 4, 1, (32 - (channel >> 4)) & 31);
++			break;
++		default:
++			return NULL; /* invalid channel type */
++		}
++	}
++
++	memcpy(vertex_data, transposed, vertex_count * vertex_size);
++	memcpy(last_vertex, &transposed[vertex_size * (vertex_count - 1)], vertex_size);
++
++	return data;
++}
++
++/* Returns 0 on success; negative values distinguish bad headers (-1), truncated data (-2) and trailing bytes (-3). */
++static int cgltf_meshopt_decode_vertex_buffer(uint8_t* destination, cgltf_size vertex_count, cgltf_size vertex_size,
++	const uint8_t* buffer, cgltf_size buffer_size)
++{
++	if (buffer_size < 1)
++		return -2;
++
++	uint8_t data_header = buffer[0];
++
++	if ((data_header & 0xf0) != CGLTF_MESHOPT_VERTEX_HEADER)
++		return -1;
++
++	int version = data_header & 0x0f;
++	if (version > CGLTF_MESHOPT_VERTEX_VERSION)
++		return -1;
++
++	const uint8_t* data = buffer + 1;
++	const uint8_t* data_end = buffer + buffer_size;
++
++	cgltf_size tail_size = vertex_size + (version == 0 ? 0 : vertex_size / 4);
++	cgltf_size tail_size_min = version == 0 ? CGLTF_MESHOPT_TAIL_MIN_SIZE_V0 : CGLTF_MESHOPT_TAIL_MIN_SIZE_V1;
++	cgltf_size tail_size_pad = tail_size < tail_size_min ? tail_size_min : tail_size;
++
++	if ((cgltf_size)(data_end - data) < tail_size_pad)
++		return -2;
++
++	const uint8_t* tail = data_end - tail_size;
++
++	uint8_t last_vertex[256];
++	memcpy(last_vertex, tail, vertex_size);
++
++	const uint8_t* channels = version == 0 ? NULL : tail + vertex_size;
++
++	cgltf_size vertex_block_size = cgltf_meshopt_get_vertex_block_size(vertex_size);
++	cgltf_size vertex_offset = 0;
++
++	while (vertex_offset < vertex_count)
++	{
++		cgltf_size block_size = (vertex_offset + vertex_block_size < vertex_count) ? vertex_block_size : vertex_count - vertex_offset;
++
++		data = cgltf_meshopt_decode_vertex_block(
++			data, data_end, destination + vertex_offset * vertex_size, block_size, vertex_size, last_vertex, channels, version);
++		if (data == NULL)
++			return -2;
++
++		vertex_offset += block_size;
++	}
++
++	if ((cgltf_size)(data_end - data) != tail_size_pad)
++		return -3;
++
++	return 0;
++}
++
++static uint32_t cgltf_meshopt_decode_vbyte(const uint8_t** data)
++{
++	uint8_t lead = *(*data)++;
++
++	/* fast path: single byte */
++	if (lead < 128)
++		return lead;
++
++	/* slow path: up to 4 extra bytes; the loop always terminates on malformed data */
++	uint32_t result = lead & 127;
++	unsigned int shift = 7;
++
++	for (int i = 0; i < 4; ++i)
++	{
++		uint8_t group = *(*data)++;
++		result |= (uint32_t)(group & 127) << shift;
++		shift += 7;
++
++		if (group < 128)
++			break;
++	}
++
++	return result;
++}
++
++static uint32_t cgltf_meshopt_decode_index(const uint8_t** data, uint32_t last)
++{
++	uint32_t v = cgltf_meshopt_decode_vbyte(data);
++	int32_t d = (int32_t)((v >> 1) ^ (0 - (v & 1)));
++
++	return last + (uint32_t)d;
++}
++
++static void* cgltf_meshopt_write_triangle(void* destination, cgltf_size index_size, uint32_t a, uint32_t b, uint32_t c)
++{
++	if (index_size == 2)
++	{
++		uint16_t* tri = (uint16_t*)destination;
++		tri[0] = (uint16_t)a;
++		tri[1] = (uint16_t)b;
++		tri[2] = (uint16_t)c;
++		return tri + 3;
++	}
++	else
++	{
++		uint32_t* tri = (uint32_t*)destination;
++		tri[0] = a;
++		tri[1] = b;
++		tri[2] = c;
++		return tri + 3;
++	}
++}
++
++static int cgltf_meshopt_decode_index_buffer(uint8_t* destination, cgltf_size index_count, cgltf_size index_size,
++	const uint8_t* buffer, cgltf_size buffer_size)
++{
++	/* the minimum valid encoding is a header, 1 byte per triangle and a 16-byte codeaux table */
++	if (buffer_size < 1 + index_count / 3 + 16)
++		return -2;
++
++	if ((buffer[0] & 0xf0) != CGLTF_MESHOPT_INDEX_HEADER)
++		return -1;
++
++	int version = buffer[0] & 0x0f;
++	if (version > CGLTF_MESHOPT_INDEX_VERSION)
++		return -1;
++
++	uint32_t vertexfifo[16];
++	uint32_t edgefifo[16][2];
++	memset(edgefifo, 0xff, sizeof(edgefifo));
++	memset(vertexfifo, 0xff, sizeof(vertexfifo));
++
++	cgltf_size edgefifooffset = 0;
++	cgltf_size vertexfifooffset = 0;
++
++	uint32_t next = 0;
++	uint32_t last = 0;
++
++	int fecmax = version >= 1 ? 13 : 15;
++
++	const uint8_t* code = buffer + 1;
++	const uint8_t* code_end = code + index_count / 3;
++	const uint8_t* data = code_end;
++
++	/* each triangle reads at most 16 bytes of data; the codeaux table sits at the end */
++	const uint8_t* data_safe_end = buffer + buffer_size - 16;
++	const uint8_t* codeaux_table = data_safe_end;
++
++	void* out = destination;
++
++	while (code < code_end)
++	{
++		uint8_t codetri = *code++;
++
++		if (codetri < 0xf0)
++		{
++			int fe = codetri >> 4;
++
++			uint32_t a = edgefifo[(edgefifooffset - 1 - fe) & 15][0];
++			uint32_t b = edgefifo[(edgefifooffset - 1 - fe) & 15][1];
++			uint32_t c = 0;
++
++			int fec = codetri & 15;
++
++			if (fec < fecmax)
++			{
++				uint32_t cf = vertexfifo[(vertexfifooffset - 1 - fec) & 15];
++
++				c = (fec == 0) ? next : cf;
++
++				if (fec == 0)
++					next += 1;
++
++				/* the fifo push order must match the encoder exactly */
++				vertexfifo[vertexfifooffset] = c;
++				vertexfifooffset = (vertexfifooffset + (fec == 0)) & 15;
++			}
++			else
++			{
++				if (data > data_safe_end)
++					return -2;
++
++				/* fec 13/14 decode into offsets -1/+1 relative to the last index */
++				last = c = (fec != 15) ? last + (uint32_t)(fec * 2 - 27) : cgltf_meshopt_decode_index(&data, last);
++
++				vertexfifo[vertexfifooffset] = c;
++				vertexfifooffset = (vertexfifooffset + 1) & 15;
++			}
++
++			edgefifo[edgefifooffset][0] = c;
++			edgefifo[edgefifooffset][1] = b;
++			edgefifooffset = (edgefifooffset + 1) & 15;
++			edgefifo[edgefifooffset][0] = a;
++			edgefifo[edgefifooffset][1] = c;
++			edgefifooffset = (edgefifooffset + 1) & 15;
++
++			out = cgltf_meshopt_write_triangle(out, index_size, a, b, c);
++		}
++		else
++		{
++			if (codetri < 0xfe)
++			{
++				/* fast path: read codeaux from the table */
++				uint8_t codeaux = codeaux_table[codetri & 15];
++
++				int feb = codeaux >> 4;
++				int fec = codeaux & 15;
++
++				uint32_t a = next++;
++
++				uint32_t bf = vertexfifo[(vertexfifooffset - feb) & 15];
++				uint32_t b = (feb == 0) ? next : bf;
++				if (feb == 0)
++					next += 1;
++
++				uint32_t cf = vertexfifo[(vertexfifooffset - fec) & 15];
++				uint32_t c = (fec == 0) ? next : cf;
++				if (fec == 0)
++					next += 1;
++
++				out = cgltf_meshopt_write_triangle(out, index_size, a, b, c);
++
++				vertexfifo[vertexfifooffset] = a;
++				vertexfifooffset = (vertexfifooffset + 1) & 15;
++				vertexfifo[vertexfifooffset] = b;
++				vertexfifooffset = (vertexfifooffset + (feb == 0)) & 15;
++				vertexfifo[vertexfifooffset] = c;
++				vertexfifooffset = (vertexfifooffset + (fec == 0)) & 15;
++
++				edgefifo[edgefifooffset][0] = b;
++				edgefifo[edgefifooffset][1] = a;
++				edgefifooffset = (edgefifooffset + 1) & 15;
++				edgefifo[edgefifooffset][0] = c;
++				edgefifo[edgefifooffset][1] = b;
++				edgefifooffset = (edgefifooffset + 1) & 15;
++				edgefifo[edgefifooffset][0] = a;
++				edgefifo[edgefifooffset][1] = c;
++				edgefifooffset = (edgefifooffset + 1) & 15;
++			}
++			else
++			{
++				if (data > data_safe_end)
++					return -2;
++
++				/* slow path: read a full byte for codeaux instead of a table lookup */
++				uint8_t codeaux = *data++;
++
++				int fea = codetri == 0xfe ? 0 : 15;
++				int feb = codeaux >> 4;
++				int fec = codeaux & 15;
++
++				/* a zero codeaux is a reset marker */
++				if (codeaux == 0)
++					next = 0;
++
++				uint32_t a = (fea == 0) ? next++ : 0;
++				uint32_t b = (feb == 0) ? next++ : vertexfifo[(vertexfifooffset - feb) & 15];
++				uint32_t c = (fec == 0) ? next++ : vertexfifo[(vertexfifooffset - fec) & 15];
++
++				if (fea == 15)
++					last = a = cgltf_meshopt_decode_index(&data, last);
++				if (feb == 15)
++					last = b = cgltf_meshopt_decode_index(&data, last);
++				if (fec == 15)
++					last = c = cgltf_meshopt_decode_index(&data, last);
++
++				out = cgltf_meshopt_write_triangle(out, index_size, a, b, c);
++
++				vertexfifo[vertexfifooffset] = a;
++				vertexfifooffset = (vertexfifooffset + 1) & 15;
++				vertexfifo[vertexfifooffset] = b;
++				vertexfifooffset = (vertexfifooffset + ((feb == 0) | (feb == 15))) & 15;
++				vertexfifo[vertexfifooffset] = c;
++				vertexfifooffset = (vertexfifooffset + ((fec == 0) | (fec == 15))) & 15;
++
++				edgefifo[edgefifooffset][0] = b;
++				edgefifo[edgefifooffset][1] = a;
++				edgefifooffset = (edgefifooffset + 1) & 15;
++				edgefifo[edgefifooffset][0] = c;
++				edgefifo[edgefifooffset][1] = b;
++				edgefifooffset = (edgefifooffset + 1) & 15;
++				edgefifo[edgefifooffset][0] = a;
++				edgefifo[edgefifooffset][1] = c;
++				edgefifooffset = (edgefifooffset + 1) & 15;
++			}
++		}
++	}
++
++	/* all data bytes must be consumed exactly at the codeaux table boundary */
++	if (data != data_safe_end)
++		return -3;
++
++	return 0;
++}
++
++static int cgltf_meshopt_decode_index_sequence(uint8_t* destination, cgltf_size index_count, cgltf_size index_size,
++	const uint8_t* buffer, cgltf_size buffer_size)
++{
++	/* the minimum valid encoding is a header, 1 byte per index and a 4-byte tail */
++	if (buffer_size < 1 + index_count + 4)
++		return -2;
++
++	if ((buffer[0] & 0xf0) != CGLTF_MESHOPT_SEQUENCE_HEADER)
++		return -1;
++
++	int version = buffer[0] & 0x0f;
++	if (version > CGLTF_MESHOPT_INDEX_VERSION)
++		return -1;
++
++	const uint8_t* data = buffer + 1;
++	const uint8_t* data_safe_end = buffer + buffer_size - 4;
++
++	uint32_t last[2] = {0, 0};
++
++	for (cgltf_size i = 0; i < index_count; ++i)
++	{
++		if (data >= data_safe_end)
++			return -2;
++
++		uint32_t v = cgltf_meshopt_decode_vbyte(&data);
++
++		uint32_t current = v & 1;
++		v >>= 1;
++
++		int32_t d = (int32_t)((v >> 1) ^ (0 - (v & 1)));
++		uint32_t index = last[current] + (uint32_t)d;
++
++		last[current] = index;
++
++		if (index_size == 2)
++			((uint16_t*)destination)[i] = (uint16_t)index;
++		else
++			((uint32_t*)destination)[i] = index;
++	}
++
++	if (data != data_safe_end)
++		return -3;
++
++	return 0;
++}
++
++/* Self-contained float helpers so the meshopt filters need no external libm.
++   They are bit-exact replacements for the fabsf/sqrtf operations the filters use. */
++static float cgltf_meshopt_fabsf(float x)
++{
++	union { float f; uint32_t u; } v;
++	v.f = x;
++	v.u &= 0x7fffffffu;
++	return v.f;
++}
++
++static float cgltf_meshopt_sqrtf(float xf)
++{
++	if (!(xf > 0.0f))
++		return 0.0f; /* covers NaN and negative inputs, matching the filters' guarded use */
++
++	/* Bit-exact, libm-free sqrtf. Build a close initial estimate using integer
++	   exponent/mantissa decomposition (valid for subnormals too), then run five
++	   double-precision Newton-Raphson iterations; double's 53 bits versus float's
++	   24 leave the result well inside half a float ulp of the exact root, and a
++	   float midpoint can never square to a float, so the narrowing conversion is
++	   correctly rounded. Only integer and multiply/divide instructions are used. */
++	double x = (double)xf;
++
++	union
++	{
++		double d;
++		uint64_t u;
++	} v;
++	v.d = x;
++
++	uint64_t bits = v.u;
++	int exponent = (int)((bits >> 52) & 0x7ff) - 1023;
++	uint64_t mantissa = bits & 0xfffffffffffffULL;
++
++	double mantissa_value;
++
++	if ((bits >> 52 & 0x7ff) == 0)
++	{
++		/* subnormal source: normalize the mantissa */
++		int shift = 0;
++		while (!(mantissa & 0x10000000000000ULL))
++		{
++			mantissa <<= 1;
++			++shift;
++		}
++		mantissa &= 0xfffffffffffffULL;
++		exponent = -1022 - shift;
++
++		union
++		{
++			double d;
++			uint64_t u;
++		} t;
++		t.u = 0x3ff0000000000000ULL | mantissa;
++		mantissa_value = t.d; /* [1, 2) */
++	}
++	else
++	{
++		union
++		{
++			double d;
++			uint64_t u;
++		} t;
++		t.u = 0x3ff0000000000000ULL | mantissa;
++		mantissa_value = t.d * 0.5; /* [0.5, 1) */
++	}
++
++	int out_exponent = (exponent - (exponent & 1)) / 2;
++
++	union
++	{
++		double d;
++		uint64_t u;
++	} estimate;
++	estimate.d = mantissa_value * 1.4142135623730951;
++	int estimate_exponent = (int)((estimate.u >> 52) & 0x7ff) + out_exponent;
++	estimate.u = (estimate.u & 0x800fffffffffffffULL) | ((uint64_t)estimate_exponent << 52);
++
++	double r = estimate.d;
++	r = 0.5 * (r + x / r);
++	r = 0.5 * (r + x / r);
++	r = 0.5 * (r + x / r);
++	r = 0.5 * (r + x / r);
++	r = 0.5 * (r + x / r);
++
++	return (float)r;
++}
++
++static void cgltf_meshopt_decode_filter_oct(uint8_t* data, cgltf_size count, cgltf_size stride)
++{
++	if (stride == 4)
++	{
++		const float max = 127.0f;
++		int8_t* q = (int8_t*)data;
++
++		for (cgltf_size i = 0; i < count; ++i)
++		{
++			float x = (float)q[i * 4 + 0];
++			float y = (float)q[i * 4 + 1];
++			float z = (float)q[i * 4 + 2] - cgltf_meshopt_fabsf(x) - cgltf_meshopt_fabsf(y);
++
++			float t = (z >= 0.f) ? 0.f : z;
++			x += (x >= 0.f) ? t : -t;
++			y += (y >= 0.f) ? t : -t;
++
++			float l = cgltf_meshopt_sqrtf(x * x + y * y + z * z);
++			float s = max / l;
++
++			/* separate float temporaries mirror the reference int(x*s +/- 0.5f) and
++			   prevent FMA contraction from changing the rounded result */
++			float xr = x * s + (x >= 0.f ? 0.5f : -0.5f);
++			float yr = y * s + (y >= 0.f ? 0.5f : -0.5f);
++			float zr = z * s + (z >= 0.f ? 0.5f : -0.5f);
++
++			q[i * 4 + 0] = (int8_t)(int)xr;
++			q[i * 4 + 1] = (int8_t)(int)yr;
++			q[i * 4 + 2] = (int8_t)(int)zr;
++		}
++	}
++	else
++	{
++		const float max = 32767.0f;
++		int16_t* q = (int16_t*)data;
++
++		for (cgltf_size i = 0; i < count; ++i)
++		{
++			float x = (float)q[i * 4 + 0];
++			float y = (float)q[i * 4 + 1];
++			float z = (float)q[i * 4 + 2] - cgltf_meshopt_fabsf(x) - cgltf_meshopt_fabsf(y);
++
++			float t = (z >= 0.f) ? 0.f : z;
++			x += (x >= 0.f) ? t : -t;
++			y += (y >= 0.f) ? t : -t;
++
++			float l = cgltf_meshopt_sqrtf(x * x + y * y + z * z);
++			float s = max / l;
++
++			float xr = x * s + (x >= 0.f ? 0.5f : -0.5f);
++			float yr = y * s + (y >= 0.f ? 0.5f : -0.5f);
++			float zr = z * s + (z >= 0.f ? 0.5f : -0.5f);
++
++			q[i * 4 + 0] = (int16_t)(int)xr;
++			q[i * 4 + 1] = (int16_t)(int)yr;
++			q[i * 4 + 2] = (int16_t)(int)zr;
++		}
++	}
++}
++
++static void cgltf_meshopt_decode_filter_quat(int16_t* data, cgltf_size count)
++{
++	const float scale = 32767.f / cgltf_meshopt_sqrtf(2.f);
++
++	for (cgltf_size i = 0; i < count; ++i)
++	{
++		int sf = data[i * 4 + 3] | 3;
++		float s = (float)sf;
++
++		float x = (float)data[i * 4 + 0];
++		float y = (float)data[i * 4 + 1];
++		float z = (float)data[i * 4 + 2];
++
++		float ws = s * s;
++		float ww = ws * 2.f - x * x - y * y - z * z;
++		float w = cgltf_meshopt_sqrtf(ww >= 0.f ? ww : 0.f);
++
++		float ss = scale / s;
++
++		/* distinct float temporaries, matching the reference rounding behavior */
++		float xr = x * ss + (x >= 0.f ? 0.5f : -0.5f);
++		float yr = y * ss + (y >= 0.f ? 0.5f : -0.5f);
++		float zr = z * ss + (z >= 0.f ? 0.5f : -0.5f);
++		float wr = w * ss + 0.5f;
++
++		int xf = (int)xr;
++		int yf = (int)yr;
++		int zf = (int)zr;
++		int wf = (int)wr;
++
++		int qc = data[i * 4 + 3] & 3;
++
++		data[i * 4 + ((qc + 1) & 3)] = (int16_t)xf;
++		data[i * 4 + ((qc + 2) & 3)] = (int16_t)yf;
++		data[i * 4 + ((qc + 3) & 3)] = (int16_t)zf;
++		data[i * 4 + ((qc + 0) & 3)] = (int16_t)wf;
++	}
++}
++
++static void cgltf_meshopt_decode_filter_exp(uint32_t* data, cgltf_size count)
++{
++	for (cgltf_size i = 0; i < count; ++i)
++	{
++		uint32_t v = data[i];
++
++		int m = (int)(v << 8) >> 8;
++		int e = (int)v >> 24;
++
++		union
++		{
++			float f;
++			uint32_t ui;
++		} u;
++
++		u.ui = (uint32_t)(e + 127) << 23;
++		u.f = u.f * (float)m;
++
++		data[i] = u.ui;
++	}
++}
++
++static void cgltf_meshopt_decode_filter_color(uint8_t* data, cgltf_size count, cgltf_size stride)
++{
++	if (stride == 4)
++	{
++		const float max = 255.0f;
++
++		for (cgltf_size i = 0; i < count; ++i)
++		{
++			int as = data[i * 4 + 3];
++			as |= as >> 1;
++			as |= as >> 2;
++			as |= as >> 4;
++
++			int y = data[i * 4 + 0], co = (int8_t)data[i * 4 + 1], cg = (int8_t)data[i * 4 + 2];
++
++			int r = y + co - cg;
++			int g = y + cg;
++			int b = y - co - cg;
++
++			int a = data[i * 4 + 3];
++			a = ((a << 1) & as) | (a & 1);
++
++			float ss = max / (float)as;
++
++			data[i * 4 + 0] = (uint8_t)((float)r * ss + 0.5f);
++			data[i * 4 + 1] = (uint8_t)((float)g * ss + 0.5f);
++			data[i * 4 + 2] = (uint8_t)((float)b * ss + 0.5f);
++			data[i * 4 + 3] = (uint8_t)((float)a * ss + 0.5f);
++		}
++	}
++	else
++	{
++		const float max = 65535.0f;
++		uint16_t* q = (uint16_t*)data;
++
++		for (cgltf_size i = 0; i < count; ++i)
++		{
++			int as = q[i * 4 + 3];
++			as |= as >> 1;
++			as |= as >> 2;
++			as |= as >> 4;
++			as |= as >> 8;
++
++			int y = q[i * 4 + 0], co = (int16_t)q[i * 4 + 1], cg = (int16_t)q[i * 4 + 2];
++
++			int r = y + co - cg;
++			int g = y + cg;
++			int b = y - co - cg;
++
++			int a = q[i * 4 + 3];
++			a = ((a << 1) & as) | (a & 1);
++
++			float ss = max / (float)as;
++
++			q[i * 4 + 0] = (uint16_t)((float)r * ss + 0.5f);
++			q[i * 4 + 1] = (uint16_t)((float)g * ss + 0.5f);
++			q[i * 4 + 2] = (uint16_t)((float)b * ss + 0.5f);
++			q[i * 4 + 3] = (uint16_t)((float)a * ss + 0.5f);
++		}
++	}
++}
++
++/*
++ * Decodes every meshopt-compressed buffer view in place. The decoded bytes are
++ * stored in cgltf_buffer_view::data and reached through cgltf_buffer_view_data,
++ * the same entry point as every uncompressed accessor read.
++ */
++static cgltf_result cgltf_decode_meshopt_views(cgltf_options* options, cgltf_data* data)
++{
++	void* (*memory_alloc)(void*, cgltf_size) = options->memory.alloc_func ? options->memory.alloc_func : &cgltf_default_alloc;
++	void (*memory_free)(void*, void*) = options->memory.free_func ? options->memory.free_func : &cgltf_default_free;
++
++	/* Reject meshopt-family revisions this build does not know how to decode.
++	   Other required extensions keep cgltf's historic permissive behavior. */
++	for (cgltf_size i = 0; i < data->extensions_required_count; ++i)
++	{
++		const char* name = data->extensions_required[i];
++
++		if (strstr(name, "meshopt_compression") != NULL
++			&& strcmp(name, "EXT_meshopt_compression") != 0
++			&& strcmp(name, "KHR_meshopt_compression") != 0)
++		{
++			return cgltf_result_unsupported_extension;
++		}
++	}
++
++	for (cgltf_size i = 0; i < data->buffer_views_count; ++i)
++	{
++		cgltf_buffer_view* view = &data->buffer_views[i];
++
++		if (!view->has_meshopt_compression)
++			continue;
++
++		cgltf_meshopt_compression* mc = &view->meshopt_compression;
++
++		if (mc->buffer == NULL || mc->buffer->data == NULL)
++			return cgltf_result_data_too_short;
++
++		if (mc->offset + mc->size > mc->buffer->size)
++			return cgltf_result_data_too_short;
++
++		const uint8_t* compressed = (const uint8_t*)mc->buffer->data + mc->offset;
++		cgltf_size decoded_size = mc->stride * mc->count;
++
++		/* zero-initialized, so a partial failure never leaves stale vertices behind */
++		uint8_t* decoded = (uint8_t*)memory_alloc(options->memory.user_data, decoded_size);
++		if (decoded == NULL)
++			return cgltf_result_out_of_memory;
++		memset(decoded, 0, decoded_size);
++
++		int codec_result = 0;
++
++		switch (mc->mode)
++		{
++		case cgltf_meshopt_compression_mode_attributes:
++			codec_result = cgltf_meshopt_decode_vertex_buffer(decoded, mc->count, mc->stride, compressed, mc->size);
++			break;
++		case cgltf_meshopt_compression_mode_triangles:
++			codec_result = cgltf_meshopt_decode_index_buffer(decoded, mc->count, mc->stride, compressed, mc->size);
++			break;
++		case cgltf_meshopt_compression_mode_indices:
++			codec_result = cgltf_meshopt_decode_index_sequence(decoded, mc->count, mc->stride, compressed, mc->size);
++			break;
++		default:
++			memory_free(options->memory.user_data, decoded);
++			return cgltf_result_unsupported_extension;
++		}
++
++		if (codec_result != 0)
++		{
++			memory_free(options->memory.user_data, decoded);
++			return cgltf_result_decode_error;
++		}
++
++		switch (mc->filter)
++		{
++		case cgltf_meshopt_compression_filter_none:
++			break;
++		case cgltf_meshopt_compression_filter_octahedral:
++			cgltf_meshopt_decode_filter_oct(decoded, mc->count, mc->stride);
++			break;
++		case cgltf_meshopt_compression_filter_quaternion:
++			cgltf_meshopt_decode_filter_quat((int16_t*)decoded, mc->count);
++			break;
++		case cgltf_meshopt_compression_filter_exponential:
++			cgltf_meshopt_decode_filter_exp((uint32_t*)decoded, mc->count * (mc->stride / 4));
++			break;
++		case cgltf_meshopt_compression_filter_color:
++			cgltf_meshopt_decode_filter_color(decoded, mc->count, mc->stride);
++			break;
++		default:
++			memory_free(options->memory.user_data, decoded);
++			return cgltf_result_unsupported_extension;
++		}
++
++		view->data = decoded;
++	}
++
++	return cgltf_result_success;
++}
++
+ cgltf_result cgltf_load_buffers(const cgltf_options* options, cgltf_data* data, const char* gltf_path)
+ {
+ 	if (options == NULL)
+@@ -1547,12 +2497,20 @@ cgltf_result cgltf_load_buffers(const cgltf_options* options, cgltf_data* data,
+ 		}
+ 	}
+ 
++	/* All source buffers are loaded; decode extension-owned buffer views through the shared cgltf_buffer_view_data entry. */
++	cgltf_result meshopt_result = cgltf_decode_meshopt_views((cgltf_options*)options, data);
++
++	if (meshopt_result != cgltf_result_success)
++	{
++		return meshopt_result;
++	}
++
+ 	return cgltf_result_success;
+ }
+ 
+ static cgltf_size cgltf_calc_index_bound(cgltf_buffer_view* buffer_view, cgltf_size offset, cgltf_component_type component_type, cgltf_size count)
+ {
+-	char* data = (char*)buffer_view->buffer->data + offset + buffer_view->offset;
++	char* data = (char*)cgltf_buffer_view_data(buffer_view) + offset;
+ 	cgltf_size bound = 0;
+ 
+ 	switch (component_type)

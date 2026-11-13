@@ -1,0 +1,18 @@
+{
+  "encBuffer": 1,
+  "placeholderBuffer": 0,
+  "encBlobFile": "compressed.bin",
+  "encBlobSize": 30055,
+  "views": [
+    {"name": "position", "encOffset": 0, "encSize": 5842, "stride": 12, "count": 510, "mode": "ATTRIBUTES", "filter": "NONE"},
+    {"name": "interleaved16", "encOffset": 5842, "encSize": 5852, "stride": 16, "count": 510, "mode": "ATTRIBUTES", "filter": "NONE"},
+    {"name": "oct4", "encOffset": 11694, "encSize": 1047, "stride": 4, "count": 510, "mode": "ATTRIBUTES", "filter": "OCTAHEDRAL"},
+    {"name": "oct8", "encOffset": 12741, "encSize": 2069, "stride": 8, "count": 510, "mode": "ATTRIBUTES", "filter": "OCTAHEDRAL"},
+    {"name": "quat8", "encOffset": 14810, "encSize": 3343, "stride": 8, "count": 510, "mode": "ATTRIBUTES", "filter": "QUATERNION"},
+    {"name": "exp12", "encOffset": 18153, "encSize": 4259, "stride": 12, "count": 510, "mode": "ATTRIBUTES", "filter": "EXPONENTIAL"},
+    {"name": "color4", "encOffset": 22412, "encSize": 2067, "stride": 4, "count": 510, "mode": "ATTRIBUTES", "filter": "COLOR"},
+    {"name": "color8", "encOffset": 24479, "encSize": 4109, "stride": 8, "count": 510, "mode": "ATTRIBUTES", "filter": "COLOR"},
+    {"name": "triangles", "encOffset": 28588, "encSize": 1091, "stride": 2, "count": 510, "mode": "TRIANGLES", "filter": "NONE"},
+    {"name": "sequence", "encOffset": 29679, "encSize": 376, "stride": 4, "count": 128, "mode": "INDICES", "filter": "NONE"}
+  ]
+}

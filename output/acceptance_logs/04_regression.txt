@@ -1,0 +1,11 @@
+== parse + conversion over official sample subset ==
+invocations=34 failures=0
+== write round trip (gltf + glb) ==
+invocations=17 failures=0
+== conversion entry point on quantized assets ==
+all quantized assets OK
+== fuzz corpus (expected error codes preserved) ==
+BadBasisU.gltf: Result: 4
+TriangleWithoutIndices.gltf: Result: 0
+WaterBottle.gltf: Result: 6
+Box.glb: Result: 0

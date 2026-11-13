@@ -1,0 +1,10 @@
+{"version": 2, "width": 100, "height": 32, "timestamp": 1794554280, "env": {"SHELL": "/bin/bash", "TERM": "xterm-256color"}}
+[0.005729, "o", "\r\n########################################################################\r\n# SEGMENT 4/6 - Write round trip: extension and quantizedBits are preserved\r\n########################################################################\r\n\r\n"]
+[2.008169, "o", "\r\n\u001b[1;36m$ writer emits the accessor extension block and registers extensionsUsed\u001b[0m\r\n"]
+[2.009937, "o", "92:#define CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION     (1 << 20)\r\n1124:\t\tcontext->extension_flags |= CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION;\r\n"]
+[2.010079, "o", "1346:\tif (extension_flags & CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION) {\r\n"]
+[4.012947, "o", "\r\n\u001b[1;36m$ round-trip JSON written by the acceptance test\u001b[0m\r\n"]
+[4.025362, "o", "accessor extension: {\"KHR_mesh_quantization\": {\"quantizedBits\": 5120}}\r\nextensionsUsed    : ['KHR_mesh_quantization']\r\n"]
+[6.030567, "o", "\r\n\u001b[1;36m$ GLB binary chunk path round trips as well\u001b[0m\r\n"]
+[6.033013, "o", "/home/gyr/feedback/uid5241/output/roundtrip/rt_quant_i8.glb\r\n"]
+[6.037078, "o", "Result: 0\r\nType: 2\r\nMeshes: 1\r\n"]

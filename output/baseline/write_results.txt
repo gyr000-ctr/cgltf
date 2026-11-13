@@ -1,0 +1,17 @@
+test_write 0 ../glTF-Sample-Models/2.0/Box/glTF-Draco/Box.gltf
+test_write 0 ../glTF-Sample-Models/2.0/Box/glTF-Embedded/Box.gltf
+test_write 0 ../glTF-Sample-Models/2.0/Box/glTF/Box.gltf
+test_write 0 ../glTF-Sample-Models/2.0/BoxTextured/glTF-Embedded/BoxTextured.gltf
+test_write 0 ../glTF-Sample-Models/2.0/BoxTextured/glTF/BoxTextured.gltf
+test_write 0 ../glTF-Sample-Models/2.0/BoxVertexColors/glTF-Embedded/BoxVertexColors.gltf
+test_write 0 ../glTF-Sample-Models/2.0/BoxVertexColors/glTF/BoxVertexColors.gltf
+test_write 0 ../glTF-Sample-Models/2.0/SimpleMeshes/glTF-Embedded/SimpleMeshes.gltf
+test_write 0 ../glTF-Sample-Models/2.0/SimpleMeshes/glTF/SimpleMeshes.gltf
+test_write 0 ../glTF-Sample-Models/2.0/TriangleWithoutIndices/glTF-Embedded/TriangleWithoutIndices.gltf
+test_write 0 ../glTF-Sample-Models/2.0/TriangleWithoutIndices/glTF/TriangleWithoutIndices.gltf
+test_write 0 ../glTF-Sample-Models/2.0/VertexColorTest/glTF-Embedded/VertexColorTest.gltf
+test_write 0 ../glTF-Sample-Models/2.0/VertexColorTest/glTF/VertexColorTest.gltf
+test_write_glb 0 ../glTF-Sample-Models/2.0/Box/glTF-Binary/Box.glb
+test_write_glb 0 ../glTF-Sample-Models/2.0/BoxTextured/glTF-Binary/BoxTextured.glb
+test_write_glb 0 ../glTF-Sample-Models/2.0/BoxVertexColors/glTF-Binary/BoxVertexColors.glb
+test_write_glb 0 ../glTF-Sample-Models/2.0/VertexColorTest/glTF-Binary/VertexColorTest.glb

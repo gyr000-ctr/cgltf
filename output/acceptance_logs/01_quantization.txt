@@ -1,0 +1,15 @@
+quant_i8.gltf            count=6 max_abs_err=0
+quant_u8.gltf            count=6 max_abs_err=2.98e-08
+quant_i16.gltf           count=6 max_abs_err=0
+quant_u16.gltf           count=6 max_abs_err=0
+quant_float_storage.gltf count=4 max_abs_err=0
+quant_i8.glb             count=6 max_abs_err=0
+quant_srgb_color.gltf    count=1 max_abs_err=0
+invalid_width_mismatch.gltf rejected (parse=0 validate=4)
+invalid_unsigned_int.gltf rejected (parse=0 validate=4)
+invalid_not_declared.gltf rejected (parse=0 validate=4)
+invalid_matrix.gltf      rejected (parse=0 validate=4)
+invalid_srgb.gltf        rejected (parse=0 validate=4)
+invalid_float_unsigned.gltf rejected (parse=0 validate=4)
+
+All KHR_mesh_quantization checks passed.

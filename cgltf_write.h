@@ -89,6 +89,7 @@ cgltf_size cgltf_write(const cgltf_options* options, char* buffer, cgltf_size si
 #define CGLTF_EXTENSION_FLAG_MATERIALS_DISPERSION (1 << 17)
 #define CGLTF_EXTENSION_FLAG_TEXTURE_WEBP          (1 << 18)
 #define CGLTF_EXTENSION_FLAG_MATERIALS_DIFFUSE_TRANSMISSION (1 << 19)
+#define CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION     (1 << 20)
 
 typedef struct {
 	char* buffer;
@@ -1118,6 +1119,19 @@ static void cgltf_write_accessor(cgltf_write_context* context, const cgltf_acces
 		cgltf_write_line(context, "}");
 		cgltf_write_line(context, "}");
 	}
+	if (accessor->has_mesh_quantization)
+	{
+		context->extension_flags |= CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION;
+		cgltf_write_line(context, "\"extensions\": {");
+		cgltf_write_line(context, "\"KHR_mesh_quantization\": {");
+		cgltf_write_intprop(context, "quantizedBits", cgltf_int_from_component_type(accessor->mesh_quantization.quantized_bits), 0);
+		if (accessor->mesh_quantization.color_space == cgltf_mesh_quantization_color_space_srgb)
+		{
+			cgltf_write_strprop(context, "colorSpace", "srgb");
+		}
+		cgltf_write_line(context, "}");
+		cgltf_write_line(context, "}");
+	}
 	cgltf_write_extras(context, &accessor->extras);
 	cgltf_write_line(context, "}");
 }
@@ -1328,6 +1342,9 @@ static void cgltf_write_extensions(cgltf_write_context* context, uint32_t extens
 	}
 	if (extension_flags & CGLTF_EXTENSION_FLAG_MATERIALS_DISPERSION) {
 		cgltf_write_stritem(context, "KHR_materials_dispersion");
+	}
+	if (extension_flags & CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION) {
+		cgltf_write_stritem(context, "KHR_mesh_quantization");
 	}
 }
 

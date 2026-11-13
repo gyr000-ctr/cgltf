@@ -1,0 +1,56 @@
+{
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5121,
+      "type": "VEC4",
+      "count": 1,
+      "extensions": {
+        "KHR_mesh_quantization": {
+          "quantizedBits": 5121,
+          "colorSpace": "srgb"
+        }
+      }
+    }
+  ],
+  "asset": {
+    "version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteLength": 4
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "data:application/octet-stream;base64,/wCA/w==",
+      "byteLength": 4
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "COLOR_0": 0
+          }
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0
+    }
+  ],
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [ 0 ]
+    }
+  ],
+  "extensionsUsed": [
+    "KHR_mesh_quantization"
+  ]
+}

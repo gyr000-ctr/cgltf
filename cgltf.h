@@ -312,6 +312,25 @@ typedef struct cgltf_meshopt_compression
 	cgltf_bool is_khr;
 } cgltf_meshopt_compression;
 
+/*
+ * KHR_mesh_quantization: vertex data is stored in integer component types
+ * (including BYTE / SHORT without "normalized": true) and has to be converted
+ * back to floating-point using the quantization volume. quantized_bits equals
+ * the storage component type on a quantized accessor, and stays 0 otherwise.
+ */
+typedef enum cgltf_mesh_quantization_color_space {
+	cgltf_mesh_quantization_color_space_none,
+	cgltf_mesh_quantization_color_space_srgb,
+	cgltf_mesh_quantization_color_space_max_enum
+} cgltf_mesh_quantization_color_space;
+
+typedef struct cgltf_mesh_quantization
+{
+	/* component type of the quantized storage; one of the integer types */
+	cgltf_component_type quantized_bits;
+	cgltf_mesh_quantization_color_space color_space;
+} cgltf_mesh_quantization;
+
 typedef struct cgltf_buffer_view
 {
 	char *name;
@@ -354,6 +373,8 @@ typedef struct cgltf_accessor
 	cgltf_float max[16];
 	cgltf_bool is_sparse;
 	cgltf_accessor_sparse sparse;
+	cgltf_bool has_mesh_quantization;
+	cgltf_mesh_quantization mesh_quantization;
 	cgltf_extras extras;
 	cgltf_size extensions_count;
 	cgltf_extension* extensions;
@@ -1603,6 +1624,45 @@ cgltf_result cgltf_validate(cgltf_data* data)
 		CGLTF_ASSERT_IF(data->accessors[i].component_type == cgltf_component_type_invalid, cgltf_result_invalid_gltf);
 		CGLTF_ASSERT_IF(data->accessors[i].type == cgltf_type_invalid, cgltf_result_invalid_gltf);
 
+		if (accessor->has_mesh_quantization)
+		{
+			cgltf_mesh_quantization* quant = &accessor->mesh_quantization;
+
+			/* quantizedBits must name one of the four integer storage formats */
+			CGLTF_ASSERT_IF(quant->quantized_bits != cgltf_component_type_r_8 &&
+			                quant->quantized_bits != cgltf_component_type_r_8u &&
+			                quant->quantized_bits != cgltf_component_type_r_16 &&
+			                quant->quantized_bits != cgltf_component_type_r_16u, cgltf_result_invalid_gltf);
+
+			if (accessor->component_type == cgltf_component_type_r_32f)
+			{
+				/* FLOAT storage only makes sense with signed integer quantizedBits */
+				CGLTF_ASSERT_IF(quant->quantized_bits != cgltf_component_type_r_8 &&
+				                quant->quantized_bits != cgltf_component_type_r_16, cgltf_result_invalid_gltf);
+			}
+			else
+			{
+				/* integer storage width must match the accessor componentType width */
+				CGLTF_ASSERT_IF(cgltf_component_size(quant->quantized_bits) != cgltf_component_size(accessor->component_type), cgltf_result_invalid_gltf);
+			}
+
+			/* matrix attributes may not be quantized */
+			CGLTF_ASSERT_IF(accessor->type == cgltf_type_mat2 ||
+			                accessor->type == cgltf_type_mat3 ||
+			                accessor->type == cgltf_type_mat4, cgltf_result_invalid_gltf);
+
+			cgltf_bool extension_declared = 0;
+			for (cgltf_size e = 0; e < data->extensions_used_count; ++e)
+			{
+				if (strcmp(data->extensions_used[e], "KHR_mesh_quantization") == 0)
+				{
+					extension_declared = 1;
+					break;
+				}
+			}
+			CGLTF_ASSERT_IF(!extension_declared, cgltf_result_invalid_gltf);
+		}
+
 		cgltf_size element_size = cgltf_calc_size(accessor->type, accessor->component_type);
 
 		if (accessor->buffer_view)
@@ -1694,6 +1754,11 @@ cgltf_result cgltf_validate(cgltf_data* data)
 			for (cgltf_size k = 0; k < data->meshes[i].primitives[j].attributes_count; ++k)
 			{
 				CGLTF_ASSERT_IF(data->meshes[i].primitives[j].attributes[k].data->count != first->count, cgltf_result_invalid_gltf);
+
+				cgltf_accessor* attribute = data->meshes[i].primitives[j].attributes[k].data;
+				CGLTF_ASSERT_IF(attribute->has_mesh_quantization &&
+				                attribute->mesh_quantization.color_space == cgltf_mesh_quantization_color_space_srgb &&
+				                data->meshes[i].primitives[j].attributes[k].type != cgltf_attribute_type_color, cgltf_result_invalid_gltf);
 			}
 
 			for (cgltf_size k = 0; k < data->meshes[i].primitives[j].targets_count; ++k)
@@ -2248,7 +2313,7 @@ static cgltf_size cgltf_component_read_index(const void* in, cgltf_component_typ
 	}
 }
 
-static cgltf_float cgltf_component_read_float(const void* in, cgltf_component_type component_type, cgltf_bool normalized)
+static cgltf_float cgltf_component_read_float(const void* in, cgltf_component_type component_type, cgltf_bool normalized, cgltf_component_type quantized_bits)
 {
 	if (component_type == cgltf_component_type_r_32f)
 	{
@@ -2273,10 +2338,32 @@ static cgltf_float cgltf_component_read_float(const void* in, cgltf_component_ty
 		}
 	}
 
+	/*
+	 * KHR_mesh_quantization: the stored integer is an affine encoding of the
+	 * dequantized value, f = raw * multiplier + offset. This is the same
+	 * read path as every other accessor; only the transform differs.
+	 */
+	if (quantized_bits != cgltf_component_type_invalid)
+	{
+		switch (quantized_bits)
+		{
+			case cgltf_component_type_r_8:
+				return (cgltf_float)*((const int8_t*) in) * (1.0f / 127.0f);
+			case cgltf_component_type_r_16:
+				return (cgltf_float)*((const int16_t*) in) * (1.0f / 32767.0f);
+			case cgltf_component_type_r_8u:
+				return (cgltf_float)*((const uint8_t*) in) * (1.0f / 255.0f);
+			case cgltf_component_type_r_16u:
+				return (cgltf_float)*((const uint16_t*) in) * (1.0f / 65535.0f);
+			default:
+				return 0;
+		}
+	}
+
 	return (cgltf_float)cgltf_component_read_integer(in, component_type);
 }
 
-static cgltf_bool cgltf_element_read_float(const uint8_t* element, cgltf_type type, cgltf_component_type component_type, cgltf_bool normalized, cgltf_float* out, cgltf_size element_size)
+static cgltf_bool cgltf_element_read_float(const uint8_t* element, cgltf_type type, cgltf_component_type component_type, cgltf_bool normalized, cgltf_component_type quantized_bits, cgltf_float* out, cgltf_size element_size)
 {
 	cgltf_size num_components = cgltf_num_components(type);
 
@@ -2290,44 +2377,44 @@ static cgltf_bool cgltf_element_read_float(const uint8_t* element, cgltf_type ty
 
 	if (type == cgltf_type_mat2 && component_size == 1)
 	{
-		out[0] = cgltf_component_read_float(element, component_type, normalized);
-		out[1] = cgltf_component_read_float(element + 1, component_type, normalized);
-		out[2] = cgltf_component_read_float(element + 4, component_type, normalized);
-		out[3] = cgltf_component_read_float(element + 5, component_type, normalized);
+		out[0] = cgltf_component_read_float(element, component_type, normalized, quantized_bits);
+		out[1] = cgltf_component_read_float(element + 1, component_type, normalized, quantized_bits);
+		out[2] = cgltf_component_read_float(element + 4, component_type, normalized, quantized_bits);
+		out[3] = cgltf_component_read_float(element + 5, component_type, normalized, quantized_bits);
 		return 1;
 	}
 
 	if (type == cgltf_type_mat3 && component_size == 1)
 	{
-		out[0] = cgltf_component_read_float(element, component_type, normalized);
-		out[1] = cgltf_component_read_float(element + 1, component_type, normalized);
-		out[2] = cgltf_component_read_float(element + 2, component_type, normalized);
-		out[3] = cgltf_component_read_float(element + 4, component_type, normalized);
-		out[4] = cgltf_component_read_float(element + 5, component_type, normalized);
-		out[5] = cgltf_component_read_float(element + 6, component_type, normalized);
-		out[6] = cgltf_component_read_float(element + 8, component_type, normalized);
-		out[7] = cgltf_component_read_float(element + 9, component_type, normalized);
-		out[8] = cgltf_component_read_float(element + 10, component_type, normalized);
+		out[0] = cgltf_component_read_float(element, component_type, normalized, quantized_bits);
+		out[1] = cgltf_component_read_float(element + 1, component_type, normalized, quantized_bits);
+		out[2] = cgltf_component_read_float(element + 2, component_type, normalized, quantized_bits);
+		out[3] = cgltf_component_read_float(element + 4, component_type, normalized, quantized_bits);
+		out[4] = cgltf_component_read_float(element + 5, component_type, normalized, quantized_bits);
+		out[5] = cgltf_component_read_float(element + 6, component_type, normalized, quantized_bits);
+		out[6] = cgltf_component_read_float(element + 8, component_type, normalized, quantized_bits);
+		out[7] = cgltf_component_read_float(element + 9, component_type, normalized, quantized_bits);
+		out[8] = cgltf_component_read_float(element + 10, component_type, normalized, quantized_bits);
 		return 1;
 	}
 
 	if (type == cgltf_type_mat3 && component_size == 2)
 	{
-		out[0] = cgltf_component_read_float(element, component_type, normalized);
-		out[1] = cgltf_component_read_float(element + 2, component_type, normalized);
-		out[2] = cgltf_component_read_float(element + 4, component_type, normalized);
-		out[3] = cgltf_component_read_float(element + 8, component_type, normalized);
-		out[4] = cgltf_component_read_float(element + 10, component_type, normalized);
-		out[5] = cgltf_component_read_float(element + 12, component_type, normalized);
-		out[6] = cgltf_component_read_float(element + 16, component_type, normalized);
-		out[7] = cgltf_component_read_float(element + 18, component_type, normalized);
-		out[8] = cgltf_component_read_float(element + 20, component_type, normalized);
+		out[0] = cgltf_component_read_float(element, component_type, normalized, quantized_bits);
+		out[1] = cgltf_component_read_float(element + 2, component_type, normalized, quantized_bits);
+		out[2] = cgltf_component_read_float(element + 4, component_type, normalized, quantized_bits);
+		out[3] = cgltf_component_read_float(element + 8, component_type, normalized, quantized_bits);
+		out[4] = cgltf_component_read_float(element + 10, component_type, normalized, quantized_bits);
+		out[5] = cgltf_component_read_float(element + 12, component_type, normalized, quantized_bits);
+		out[6] = cgltf_component_read_float(element + 16, component_type, normalized, quantized_bits);
+		out[7] = cgltf_component_read_float(element + 18, component_type, normalized, quantized_bits);
+		out[8] = cgltf_component_read_float(element + 20, component_type, normalized, quantized_bits);
 		return 1;
 	}
 
 	for (cgltf_size i = 0; i < num_components; ++i)
 	{
-		out[i] = cgltf_component_read_float(element + component_size * i, component_type, normalized);
+		out[i] = cgltf_component_read_float(element + component_size * i, component_type, normalized, quantized_bits);
 	}
 	return 1;
 }
@@ -2390,13 +2477,21 @@ static const uint8_t* cgltf_find_sparse_index(const cgltf_accessor* accessor, cg
 	return index == needle ? value_data + offset * accessor->stride : NULL;
 }
 
+/* Effective quantization storage for an accessor, or invalid when unquantized. */
+static cgltf_component_type cgltf_accessor_quantized_bits(const cgltf_accessor* accessor)
+{
+	return accessor->has_mesh_quantization ? accessor->mesh_quantization.quantized_bits : cgltf_component_type_invalid;
+}
+
 cgltf_bool cgltf_accessor_read_float(const cgltf_accessor* accessor, cgltf_size index, cgltf_float* out, cgltf_size element_size)
 {
+	cgltf_component_type quantized_bits = cgltf_accessor_quantized_bits(accessor);
+
 	if (accessor->is_sparse)
 	{
 		const uint8_t* element = cgltf_find_sparse_index(accessor, index);
 		if (element)
-			return cgltf_element_read_float(element, accessor->type, accessor->component_type, accessor->normalized, out, element_size);
+			return cgltf_element_read_float(element, accessor->type, accessor->component_type, accessor->normalized, quantized_bits, out, element_size);
 	}
 	if (accessor->buffer_view == NULL)
 	{
@@ -2409,7 +2504,7 @@ cgltf_bool cgltf_accessor_read_float(const cgltf_accessor* accessor, cgltf_size 
 		return 0;
 	}
 	element += accessor->offset + accessor->stride * index;
-	return cgltf_element_read_float(element, accessor->type, accessor->component_type, accessor->normalized, out, element_size);
+	return cgltf_element_read_float(element, accessor->type, accessor->component_type, accessor->normalized, quantized_bits, out, element_size);
 }
 
 cgltf_size cgltf_accessor_unpack_floats(const cgltf_accessor* accessor, cgltf_float* out, cgltf_size float_count)
@@ -2423,6 +2518,7 @@ cgltf_size cgltf_accessor_unpack_floats(const cgltf_accessor* accessor, cgltf_fl
 
 	float_count = available_floats < float_count ? available_floats : float_count;
 	cgltf_size element_count = float_count / floats_per_element;
+	cgltf_component_type quantized_bits = cgltf_accessor_quantized_bits(accessor);
 
 	// First pass: convert each element in the base accessor.
 	if (accessor->buffer_view == NULL)
@@ -2448,7 +2544,7 @@ cgltf_size cgltf_accessor_unpack_floats(const cgltf_accessor* accessor, cgltf_fl
 
 			for (cgltf_size index = 0; index < element_count; index++, dest += floats_per_element, element += accessor->stride)
 			{
-				if (!cgltf_element_read_float(element, accessor->type, accessor->component_type, accessor->normalized, dest, floats_per_element))
+				if (!cgltf_element_read_float(element, accessor->type, accessor->component_type, accessor->normalized, quantized_bits, dest, floats_per_element))
 				{
 					return 0;
 				}
@@ -2478,7 +2574,7 @@ cgltf_size cgltf_accessor_unpack_floats(const cgltf_accessor* accessor, cgltf_fl
 			size_t writer_index = cgltf_component_read_index(index_data, sparse->indices_component_type);
 			float* writer_head = out + writer_index * floats_per_element;
 
-			if (!cgltf_element_read_float(reader_head, accessor->type, accessor->component_type, accessor->normalized, writer_head, floats_per_element))
+			if (!cgltf_element_read_float(reader_head, accessor->type, accessor->component_type, accessor->normalized, quantized_bits, writer_head, floats_per_element))
 			{
 				return 0;
 			}
@@ -3684,6 +3780,50 @@ static int cgltf_parse_json_accessor_sparse(jsmntok_t const* tokens, int i, cons
 	return i;
 }
 
+static int cgltf_parse_json_mesh_quantization(jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_mesh_quantization* out_mesh_quantization)
+{
+	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+
+	int size = tokens[i].size;
+	++i;
+
+	for (int j = 0; j < size; ++j)
+	{
+		CGLTF_CHECK_KEY(tokens[i]);
+
+		if (cgltf_json_strcmp(tokens+i, json_chunk, "quantizedBits") == 0)
+		{
+			++i;
+			out_mesh_quantization->quantized_bits = cgltf_json_to_component_type(tokens + i, json_chunk);
+			++i;
+		}
+		else if (cgltf_json_strcmp(tokens+i, json_chunk, "colorSpace") == 0)
+		{
+			++i;
+			if (cgltf_json_strcmp(tokens+i, json_chunk, "srgb") == 0)
+			{
+				out_mesh_quantization->color_space = cgltf_mesh_quantization_color_space_srgb;
+			}
+			else if (cgltf_json_strcmp(tokens+i, json_chunk, "none") == 0)
+			{
+				out_mesh_quantization->color_space = cgltf_mesh_quantization_color_space_none;
+			}
+			++i;
+		}
+		else
+		{
+			i = cgltf_skip_json(tokens, i+1);
+		}
+
+		if (i < 0)
+		{
+			return i;
+		}
+	}
+
+	return i;
+}
+
 static int cgltf_parse_json_accessor(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_accessor* out_accessor)
 {
 	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
@@ -3790,7 +3930,43 @@ static int cgltf_parse_json_accessor(cgltf_options* options, jsmntok_t const* to
 		}
 		else if (cgltf_json_strcmp(tokens + i, json_chunk, "extensions") == 0)
 		{
-			i = cgltf_parse_json_unprocessed_extensions(options, tokens, i, json_chunk, &out_accessor->extensions_count, &out_accessor->extensions);
+			++i;
+
+			CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+			if (out_accessor->extensions)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+
+			int extensions_size = tokens[i].size;
+			out_accessor->extensions_count = 0;
+			out_accessor->extensions = (cgltf_extension*)cgltf_calloc(options, sizeof(cgltf_extension), extensions_size);
+
+			if (!out_accessor->extensions)
+			{
+				return CGLTF_ERROR_NOMEM;
+			}
+
+			++i;
+			for (int k = 0; k < extensions_size; ++k)
+			{
+				CGLTF_CHECK_KEY(tokens[i]);
+
+				if (cgltf_json_strcmp(tokens+i, json_chunk, "KHR_mesh_quantization") == 0)
+				{
+					out_accessor->has_mesh_quantization = 1;
+					i = cgltf_parse_json_mesh_quantization(tokens, i + 1, json_chunk, &out_accessor->mesh_quantization);
+				}
+				else
+				{
+					i = cgltf_parse_json_unprocessed_extension(options, tokens, i, json_chunk, &(out_accessor->extensions[out_accessor->extensions_count++]));
+				}
+
+				if (i < 0)
+				{
+					return i;
+				}
+			}
 		}
 		else
 		{

@@ -86,6 +86,47 @@ Note that cgltf does not write the contents of extra files such as buffers or im
 **For more in-depth documentation and a description of the public interface refer to the top of the `cgltf_write.h` file.**
 
 
+## Usage: Draco decoding
+cgltf parses the `KHR_draco_mesh_compression` extension structure, but does not bundle a Draco
+decoder. To actually decompress a Draco-compressed primitive, plug a decoder library (for example
+[Google's Draco](https://github.com/google/draco)) into `cgltf_decode_draco_primitive`:
+
+```c
+cgltf_draco_options draco_opts;
+draco_opts.decode_func = my_draco_decode_callback; /* see below */
+draco_opts.user_data = NULL;
+
+cgltf_draco_result result = cgltf_decode_draco_primitive(data, primitive, &draco_opts);
+if (result == cgltf_draco_result_success)
+{
+    /* primitive->attributes and primitive->indices now point to decoded
+       accessors that work with cgltf_accessor_read_float and friends */
+}
+```
+
+The decode callback receives the compressed bitstream and reports the decompressed data through
+`cgltf_draco_mesh_add_attribute` and `cgltf_draco_mesh_set_indices`:
+
+```c
+cgltf_draco_result my_draco_decode_callback(void* user_data, const cgltf_data* data,
+    const cgltf_primitive* primitive, const void* compressed_data, cgltf_size compressed_size,
+    cgltf_draco_mesh* out_mesh)
+{
+    /* decode compressed_data with your Draco decoder, then for each attribute: */
+    /* cgltf_draco_mesh_add_attribute(out_mesh, cgltf_attribute_type_position, 0,
+           cgltf_component_type_r_32f, cgltf_type_vec3, vertex_count, positions); */
+    /* cgltf_draco_mesh_set_indices(out_mesh, cgltf_component_type_r_32u, index_count, indices); */
+}
+```
+
+Decoding happens on demand, one primitive at a time; the decoded data is cached per primitive and
+released by `cgltf_free`. Failures are reported through distinct `cgltf_draco_result` values
+(e.g. `cgltf_draco_result_decode_failed` for a corrupt bitstream,
+`cgltf_draco_result_attribute_mismatch` when the decoded attributes don't match the glTF attribute
+mapping, `cgltf_draco_result_index_out_of_range` for invalid indices). If no decode callback is
+supplied, `cgltf_draco_result_unsupported` is returned and the parsed data is left untouched.
+`test/test_draco_real.cpp` contains a complete adapter for Google's Draco library.
+
 ## Features
 cgltf supports core glTF 2.0:
 - glb (binary files) and gltf (JSON files)
@@ -163,3 +204,9 @@ Here's one way to build and run the test:
     ./test_all.py
 
 There is also a llvm-fuzz test in `fuzz/`. See http://llvm.org/docs/LibFuzzer.html for more information.
+
+The `test_draco` executable exercises the Draco decoding pipeline (attribute mapping, index
+validation, error handling, memory ownership) with a mock decoder and needs no extra dependencies.
+When CMake is configured with `-DDRACO_ROOT=<path to a Draco install prefix>`, an additional
+`test_draco_real` target is built that round-trips real Draco-compressed glTF assets through
+Google's Draco library.

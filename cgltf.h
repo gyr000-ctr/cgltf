@@ -86,6 +86,19 @@
  * `cgltf_accessor_read_index` is similar to its floating-point counterpart, but it returns size_t
  * and only works with single-component data types.
  *
+ * `cgltf_decode_draco_primitive` optionally decodes a single primitive that uses the
+ * KHR_draco_mesh_compression extension. cgltf itself does not bundle a Draco decoder; instead
+ * the caller supplies a decode callback (via `cgltf_draco_options`) that turns the compressed
+ * bitstream into attribute and index data by calling `cgltf_draco_mesh_add_attribute` and
+ * `cgltf_draco_mesh_set_indices`. On success the primitive's attribute list and indices are
+ * replaced by decoded cgltf_accessor/cgltf_buffer_view views owned by the cgltf_data object, so
+ * the usual accessor read functions work on them. Decoding happens on demand, one primitive at
+ * a time; the result is cached, so decoding the same primitive again is a no-op, and everything
+ * is released by `cgltf_free`. When no decoder callback is supplied, or the primitive is not
+ * Draco-compressed, the cgltf_data structure is left untouched. Failures are reported through
+ * distinct `cgltf_draco_result` values and never leak memory. If Draco decoding is never used,
+ * the API and behavior of cgltf are unchanged.
+ *
  * `cgltf_copy_extras_json` allows users to retrieve the "extras" data that can be attached to many
  * glTF objects (which can be arbitrary JSON data). This is a legacy function, consider using
  * cgltf_extras::data directly instead. You can parse this data using your own JSON parser
@@ -598,6 +611,43 @@ typedef struct cgltf_draco_mesh_compression {
 	cgltf_size attributes_count;
 } cgltf_draco_mesh_compression;
 
+typedef enum cgltf_draco_result
+{
+	cgltf_draco_result_success,
+	cgltf_draco_result_invalid_arguments,   /* null or otherwise invalid arguments */
+	cgltf_draco_result_not_compressed,      /* the primitive does not use KHR_draco_mesh_compression */
+	cgltf_draco_result_buffer_not_loaded,   /* the Draco buffer view has no data; call cgltf_load_buffers first */
+	cgltf_draco_result_decode_failed,       /* the decoder rejected the bitstream (corrupt or unsupported data) */
+	cgltf_draco_result_attribute_mismatch,  /* the decoded attributes do not match the glTF attribute mapping */
+	cgltf_draco_result_index_out_of_range,  /* the decoded indices reference vertices that do not exist */
+	cgltf_draco_result_out_of_memory,       /* an allocation failed while decoding */
+	cgltf_draco_result_unsupported,         /* no decoder callback was provided */
+	cgltf_draco_result_max_enum
+} cgltf_draco_result;
+
+/* Opaque handle passed to the decode callback; decoders fill it through the
+   cgltf_draco_mesh_add_attribute / cgltf_draco_mesh_set_indices functions below. */
+typedef struct cgltf_draco_mesh cgltf_draco_mesh;
+
+struct cgltf_data;
+struct cgltf_primitive;
+
+/* Decodes compressed_data (the contents of the Draco buffer view) and reports the
+   decompressed mesh through out_mesh. The data pointers passed to
+   cgltf_draco_mesh_add_attribute / cgltf_draco_mesh_set_indices are copied, so the
+   decoder may free its own buffers once the callback returns.
+   `data` and `primitive` describe the primitive being decoded; in particular,
+   primitive->draco_mesh_compression.attributes maps attribute semantics to the
+   Draco attribute unique ids (parsed as accessor indices; use cgltf_accessor_index
+   to recover the integer id). */
+typedef cgltf_draco_result (*cgltf_draco_decode_func)(void* user_data, const struct cgltf_data* data, const struct cgltf_primitive* primitive, const void* compressed_data, cgltf_size compressed_size, cgltf_draco_mesh* out_mesh);
+
+typedef struct cgltf_draco_options
+{
+	cgltf_draco_decode_func decode_func; /* NULL disables Draco decoding */
+	void* user_data;
+} cgltf_draco_options;
+
 typedef struct cgltf_mesh_gpu_instancing {
 	cgltf_attribute* attributes;
 	cgltf_size attributes_count;
@@ -841,6 +891,9 @@ typedef struct cgltf_data
 
 	cgltf_memory_options memory;
 	cgltf_file_options file;
+
+	/* Internal: decoded KHR_draco_mesh_compression primitives, see cgltf_decode_draco_primitive. Released by cgltf_free. */
+	void* draco_decoded;
 } cgltf_data;
 
 cgltf_result cgltf_parse(
@@ -885,6 +938,19 @@ cgltf_size cgltf_calc_size(cgltf_type type, cgltf_component_type component_type)
 
 cgltf_size cgltf_accessor_unpack_floats(const cgltf_accessor* accessor, cgltf_float* out, cgltf_size float_count);
 cgltf_size cgltf_accessor_unpack_indices(const cgltf_accessor* accessor, void* out, cgltf_size out_component_size, cgltf_size index_count);
+
+/* Decoder-facing API: called from a cgltf_draco_decode_func callback to report decompressed data.
+   `index` is the attribute set index (0 for POSITION, NORMAL, TANGENT, COLOR_0; N for TEXCOORD_N, ...).
+   The `data` pointer must reference `count` tightly packed elements of the given component/accessor
+   type; the contents are copied. */
+cgltf_draco_result cgltf_draco_mesh_add_attribute(cgltf_draco_mesh* mesh, cgltf_attribute_type type, cgltf_size index, cgltf_component_type component_type, cgltf_type accessor_type, cgltf_size count, const void* data);
+cgltf_draco_result cgltf_draco_mesh_set_indices(cgltf_draco_mesh* mesh, cgltf_component_type component_type, cgltf_size count, const void* data);
+
+/* Decodes a single KHR_draco_mesh_compression primitive on demand. On success, primitive->attributes
+   and primitive->indices point to decoded accessors owned by `data`; they remain valid until
+   cgltf_free(data). Calling this again on an already decoded primitive returns cgltf_draco_result_success
+   without decoding twice. */
+cgltf_draco_result cgltf_decode_draco_primitive(cgltf_data* data, cgltf_primitive* primitive, const cgltf_draco_options* options);
 
 /* this function is deprecated and will be removed in the future; use cgltf_extras::data instead */
 cgltf_result cgltf_copy_extras_json(const cgltf_data* data, const cgltf_extras* extras, char* dest, cgltf_size* dest_size);
@@ -1848,11 +1914,552 @@ static void cgltf_free_extensions(cgltf_data* data, cgltf_extension* extensions,
 	data->memory.free_func(data->memory.user_data, extensions);
 }
 
+/*
+ * Optional KHR_draco_mesh_compression decoding. cgltf does not bundle a Draco decoder; the caller
+ * provides a cgltf_draco_decode_func callback (for example backed by Google's Draco library) that
+ * reports the decompressed data through cgltf_draco_mesh_add_attribute and
+ * cgltf_draco_mesh_set_indices. cgltf validates the reported data against the glTF attribute
+ * mapping, builds cgltf_accessor/cgltf_buffer_view views for it and patches the primitive.
+ */
+
+typedef struct cgltf_draco_decoded_attribute
+{
+	cgltf_attribute_type type;
+	cgltf_size index;
+	cgltf_component_type component_type;
+	cgltf_type accessor_type;
+	cgltf_size count;
+	cgltf_size size; /* count * element size, in bytes */
+	void* data;      /* owned copy, released by cgltf_draco_mesh_clear */
+} cgltf_draco_decoded_attribute;
+
+struct cgltf_draco_mesh
+{
+	cgltf_memory_options* memory;
+	cgltf_draco_decoded_attribute* attributes;
+	cgltf_size attributes_count;
+	cgltf_size attributes_capacity;
+	cgltf_bool has_indices;
+	cgltf_component_type indices_component_type;
+	cgltf_size indices_count;
+	cgltf_size indices_size;
+	void* indices_data; /* owned copy, released by cgltf_draco_mesh_clear */
+	cgltf_bool out_of_memory; /* sticky flag, set when an allocation fails */
+};
+
+static void* cgltf_draco_alloc(cgltf_draco_mesh* mesh, cgltf_size size)
+{
+	void* ptr = mesh->memory->alloc_func(mesh->memory->user_data, size);
+	if (!ptr)
+	{
+		mesh->out_of_memory = 1;
+	}
+	return ptr;
+}
+
+cgltf_draco_result cgltf_draco_mesh_add_attribute(cgltf_draco_mesh* mesh, cgltf_attribute_type type, cgltf_size index, cgltf_component_type component_type, cgltf_type accessor_type, cgltf_size count, const void* data)
+{
+	if (!mesh || type <= cgltf_attribute_type_invalid || type >= cgltf_attribute_type_max_enum ||
+		component_type <= cgltf_component_type_invalid || component_type >= cgltf_component_type_max_enum ||
+		accessor_type <= cgltf_type_invalid || accessor_type >= cgltf_type_max_enum)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	if (count > 0 && !data)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	for (cgltf_size i = 0; i < mesh->attributes_count; ++i)
+	{
+		if (mesh->attributes[i].type == type && mesh->attributes[i].index == index)
+		{
+			return cgltf_draco_result_attribute_mismatch;
+		}
+	}
+
+	cgltf_size element_size = cgltf_calc_size(accessor_type, component_type);
+	if (element_size == 0 || count > SIZE_MAX / element_size)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+	cgltf_size size = count * element_size;
+
+	if (mesh->attributes_count == mesh->attributes_capacity)
+	{
+		cgltf_size capacity = mesh->attributes_capacity ? mesh->attributes_capacity * 2 : 8;
+		if (capacity > SIZE_MAX / sizeof(cgltf_draco_decoded_attribute))
+		{
+			mesh->out_of_memory = 1;
+			return cgltf_draco_result_out_of_memory;
+		}
+		cgltf_draco_decoded_attribute* grown = (cgltf_draco_decoded_attribute*)cgltf_draco_alloc(mesh, capacity * sizeof(cgltf_draco_decoded_attribute));
+		if (!grown)
+		{
+			return cgltf_draco_result_out_of_memory;
+		}
+		memcpy(grown, mesh->attributes, mesh->attributes_count * sizeof(cgltf_draco_decoded_attribute));
+		mesh->memory->free_func(mesh->memory->user_data, mesh->attributes);
+		mesh->attributes = grown;
+		mesh->attributes_capacity = capacity;
+	}
+
+	void* copy = NULL;
+	if (size > 0)
+	{
+		copy = cgltf_draco_alloc(mesh, size);
+		if (!copy)
+		{
+			return cgltf_draco_result_out_of_memory;
+		}
+		memcpy(copy, data, size);
+	}
+
+	cgltf_draco_decoded_attribute* attribute = &mesh->attributes[mesh->attributes_count++];
+	attribute->type = type;
+	attribute->index = index;
+	attribute->component_type = component_type;
+	attribute->accessor_type = accessor_type;
+	attribute->count = count;
+	attribute->size = size;
+	attribute->data = copy;
+	return cgltf_draco_result_success;
+}
+
+cgltf_draco_result cgltf_draco_mesh_set_indices(cgltf_draco_mesh* mesh, cgltf_component_type component_type, cgltf_size count, const void* data)
+{
+	if (!mesh || (component_type != cgltf_component_type_r_8u && component_type != cgltf_component_type_r_16u && component_type != cgltf_component_type_r_32u))
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	if (count > 0 && !data)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	if (mesh->has_indices)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	cgltf_size component_size = cgltf_component_size(component_type);
+	if (count > SIZE_MAX / component_size)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+	cgltf_size size = count * component_size;
+
+	void* copy = NULL;
+	if (size > 0)
+	{
+		copy = cgltf_draco_alloc(mesh, size);
+		if (!copy)
+		{
+			return cgltf_draco_result_out_of_memory;
+		}
+		memcpy(copy, data, size);
+	}
+
+	mesh->has_indices = 1;
+	mesh->indices_component_type = component_type;
+	mesh->indices_count = count;
+	mesh->indices_size = size;
+	mesh->indices_data = copy;
+	return cgltf_draco_result_success;
+}
+
+static void cgltf_draco_mesh_clear(cgltf_draco_mesh* mesh)
+{
+	for (cgltf_size i = 0; i < mesh->attributes_count; ++i)
+	{
+		mesh->memory->free_func(mesh->memory->user_data, mesh->attributes[i].data);
+	}
+	mesh->memory->free_func(mesh->memory->user_data, mesh->attributes);
+	mesh->memory->free_func(mesh->memory->user_data, mesh->indices_data);
+}
+
+typedef struct cgltf_draco_decoded_primitive
+{
+	cgltf_primitive* primitive;
+	cgltf_attribute* original_attributes;
+	cgltf_size original_attributes_count;
+	cgltf_accessor* original_indices;
+
+	cgltf_buffer buffer;             /* synthetic buffer that owns the decoded blob */
+	cgltf_buffer_view* buffer_views; /* one view per attribute, plus one for the indices */
+	cgltf_size buffer_views_count;
+	cgltf_accessor* accessors;       /* one accessor per attribute, plus one for the indices */
+	cgltf_size accessors_count;
+	cgltf_attribute* attributes;     /* decoded attribute list, ordered like the glTF attribute mapping */
+	cgltf_size attributes_count;
+
+	struct cgltf_draco_decoded_primitive* next;
+} cgltf_draco_decoded_primitive;
+
+static void cgltf_draco_free_entry(cgltf_data* data, cgltf_draco_decoded_primitive* entry)
+{
+	for (cgltf_size i = 0; i < entry->attributes_count; ++i)
+	{
+		data->memory.free_func(data->memory.user_data, entry->attributes[i].name);
+	}
+	data->memory.free_func(data->memory.user_data, entry->attributes);
+	data->memory.free_func(data->memory.user_data, entry->accessors);
+	data->memory.free_func(data->memory.user_data, entry->buffer_views);
+	data->memory.free_func(data->memory.user_data, entry->buffer.data);
+	data->memory.free_func(data->memory.user_data, entry);
+}
+
+static void cgltf_free_draco_decoded(cgltf_data* data)
+{
+	cgltf_draco_decoded_primitive* entry = (cgltf_draco_decoded_primitive*)data->draco_decoded;
+	while (entry)
+	{
+		cgltf_draco_decoded_primitive* next = entry->next;
+
+		/* restore the original parsed state so that cgltf_free releases it as usual */
+		entry->primitive->attributes = entry->original_attributes;
+		entry->primitive->attributes_count = entry->original_attributes_count;
+		entry->primitive->indices = entry->original_indices;
+
+		cgltf_draco_free_entry(data, entry);
+		entry = next;
+	}
+	data->draco_decoded = NULL;
+}
+
+static cgltf_draco_decoded_attribute* cgltf_draco_find_attribute(cgltf_draco_mesh* mesh, cgltf_attribute_type type, cgltf_size index)
+{
+	for (cgltf_size i = 0; i < mesh->attributes_count; ++i)
+	{
+		if (mesh->attributes[i].type == type && mesh->attributes[i].index == index)
+		{
+			return &mesh->attributes[i];
+		}
+	}
+	return NULL;
+}
+
+static cgltf_draco_result cgltf_draco_finalize(cgltf_data* data, cgltf_primitive* primitive, cgltf_draco_mesh* mesh)
+{
+	cgltf_draco_mesh_compression* draco = &primitive->draco_mesh_compression;
+	cgltf_memory_options* memory = &data->memory;
+
+	if (mesh->attributes_count != draco->attributes_count)
+	{
+		return cgltf_draco_result_attribute_mismatch;
+	}
+
+	/* all decoded attributes must have the same element count */
+	cgltf_size vertex_count = mesh->attributes_count ? mesh->attributes[0].count : 0;
+	for (cgltf_size i = 1; i < mesh->attributes_count; ++i)
+	{
+		if (mesh->attributes[i].count != vertex_count)
+		{
+			return cgltf_draco_result_attribute_mismatch;
+		}
+	}
+
+	/* every attribute of the glTF attribute mapping must be present in the decoded data */
+	for (cgltf_size i = 0; i < draco->attributes_count; ++i)
+	{
+		cgltf_attribute* mapping = &draco->attributes[i];
+		cgltf_draco_decoded_attribute* decoded = cgltf_draco_find_attribute(mesh, mapping->type, (cgltf_size)mapping->index);
+		if (!decoded)
+		{
+			return cgltf_draco_result_attribute_mismatch;
+		}
+		/* if the primitive declares a placeholder accessor for this semantic, the decoded layout must match it */
+		for (cgltf_size j = 0; j < primitive->attributes_count; ++j)
+		{
+			cgltf_attribute* declared = &primitive->attributes[j];
+			if (declared->type == mapping->type && declared->index == mapping->index)
+			{
+				if (declared->data && (declared->data->component_type != decoded->component_type || declared->data->type != decoded->accessor_type))
+				{
+					return cgltf_draco_result_attribute_mismatch;
+				}
+				break;
+			}
+		}
+	}
+
+	/* decoded indices must reference existing vertices */
+	cgltf_bool has_indices = mesh->has_indices && mesh->indices_count > 0;
+	if (has_indices)
+	{
+		cgltf_size component_size = cgltf_component_size(mesh->indices_component_type);
+		const uint8_t* indices = (const uint8_t*)mesh->indices_data;
+		for (cgltf_size i = 0; i < mesh->indices_count; ++i)
+		{
+			cgltf_size index = 0;
+			if (component_size == 1)
+			{
+				index = indices[i];
+			}
+			else if (component_size == 2)
+			{
+				uint16_t value;
+				memcpy(&value, indices + i * 2, sizeof(value));
+				index = value;
+			}
+			else
+			{
+				uint32_t value;
+				memcpy(&value, indices + i * 4, sizeof(value));
+				index = value;
+			}
+			if (index >= vertex_count)
+			{
+				return cgltf_draco_result_index_out_of_range;
+			}
+		}
+	}
+
+	cgltf_size view_count = mesh->attributes_count + (has_indices ? 1 : 0);
+	cgltf_size blob_size = 0;
+	for (cgltf_size i = 0; i < mesh->attributes_count; ++i)
+	{
+		if (mesh->attributes[i].size > SIZE_MAX - blob_size)
+		{
+			return cgltf_draco_result_invalid_arguments;
+		}
+		blob_size += mesh->attributes[i].size;
+	}
+	if (mesh->indices_size > SIZE_MAX - blob_size)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+	blob_size += has_indices ? mesh->indices_size : 0;
+
+	cgltf_draco_decoded_primitive* entry = (cgltf_draco_decoded_primitive*)memory->alloc_func(memory->user_data, sizeof(cgltf_draco_decoded_primitive));
+	if (!entry)
+	{
+		return cgltf_draco_result_out_of_memory;
+	}
+	memset(entry, 0, sizeof(*entry));
+
+	entry->buffer.size = blob_size;
+	entry->buffer.data_free_method = cgltf_data_free_method_none;
+	entry->buffer_views_count = view_count;
+	entry->accessors_count = view_count;
+
+	if (blob_size > 0)
+	{
+		entry->buffer.data = memory->alloc_func(memory->user_data, blob_size);
+		if (!entry->buffer.data)
+		{
+			goto fail;
+		}
+	}
+	if (view_count > 0)
+	{
+		entry->buffer_views = (cgltf_buffer_view*)memory->alloc_func(memory->user_data, view_count * sizeof(cgltf_buffer_view));
+		entry->accessors = (cgltf_accessor*)memory->alloc_func(memory->user_data, view_count * sizeof(cgltf_accessor));
+		if (!entry->buffer_views || !entry->accessors)
+		{
+			goto fail;
+		}
+		memset(entry->buffer_views, 0, view_count * sizeof(cgltf_buffer_view));
+		memset(entry->accessors, 0, view_count * sizeof(cgltf_accessor));
+	}
+
+	/* copy the decoded data into a single blob and build the views/accessors for it */
+	{
+		cgltf_size offset = 0;
+		for (cgltf_size i = 0; i < mesh->attributes_count; ++i)
+		{
+			cgltf_draco_decoded_attribute* decoded = &mesh->attributes[i];
+			cgltf_size element_size = cgltf_calc_size(decoded->accessor_type, decoded->component_type);
+
+			if (decoded->size > 0)
+			{
+				memcpy((uint8_t*)entry->buffer.data + offset, decoded->data, decoded->size);
+			}
+
+			cgltf_buffer_view* view = &entry->buffer_views[i];
+			view->buffer = &entry->buffer;
+			view->offset = offset;
+			view->size = decoded->size;
+			view->stride = element_size;
+			view->type = cgltf_buffer_view_type_vertices;
+
+			cgltf_accessor* accessor = &entry->accessors[i];
+			accessor->component_type = decoded->component_type;
+			accessor->type = decoded->accessor_type;
+			accessor->count = decoded->count;
+			accessor->stride = element_size;
+			accessor->buffer_view = view;
+
+			/* inherit the normalization flag from the placeholder accessor */
+			for (cgltf_size j = 0; j < primitive->attributes_count; ++j)
+			{
+				if (primitive->attributes[j].type == decoded->type && primitive->attributes[j].index == (cgltf_int)decoded->index)
+				{
+					accessor->normalized = primitive->attributes[j].data ? primitive->attributes[j].data->normalized : 0;
+					break;
+				}
+			}
+
+			offset += decoded->size;
+		}
+
+		if (has_indices)
+		{
+			memcpy((uint8_t*)entry->buffer.data + offset, mesh->indices_data, mesh->indices_size);
+
+			cgltf_buffer_view* view = &entry->buffer_views[mesh->attributes_count];
+			view->buffer = &entry->buffer;
+			view->offset = offset;
+			view->size = mesh->indices_size;
+			view->stride = cgltf_component_size(mesh->indices_component_type);
+			view->type = cgltf_buffer_view_type_indices;
+
+			cgltf_accessor* accessor = &entry->accessors[mesh->attributes_count];
+			accessor->component_type = mesh->indices_component_type;
+			accessor->type = cgltf_type_scalar;
+			accessor->count = mesh->indices_count;
+			accessor->stride = view->stride;
+			accessor->buffer_view = view;
+		}
+	}
+
+	/* The decoded attribute list mirrors the primitive's declared attributes: semantics
+	   covered by the Draco mapping point to the decoded accessors, any other attributes
+	   keep their original accessors. If the primitive declares no attributes, the list
+	   is built from the extension mapping instead. */
+	entry->attributes_count = primitive->attributes_count ? primitive->attributes_count : draco->attributes_count;
+	if (entry->attributes_count > 0)
+	{
+		entry->attributes = (cgltf_attribute*)memory->alloc_func(memory->user_data, entry->attributes_count * sizeof(cgltf_attribute));
+		if (!entry->attributes)
+		{
+			goto fail;
+		}
+		memset(entry->attributes, 0, entry->attributes_count * sizeof(cgltf_attribute));
+	}
+	for (cgltf_size i = 0; i < entry->attributes_count; ++i)
+	{
+		cgltf_attribute* source = primitive->attributes_count ? &primitive->attributes[i] : &draco->attributes[i];
+		cgltf_draco_decoded_attribute* decoded = cgltf_draco_find_attribute(mesh, source->type, (cgltf_size)source->index);
+		cgltf_attribute* attribute = &entry->attributes[i];
+
+		if (source->name)
+		{
+			cgltf_size name_length = strlen(source->name) + 1;
+			attribute->name = (char*)memory->alloc_func(memory->user_data, name_length);
+			if (!attribute->name)
+			{
+				goto fail;
+			}
+			memcpy(attribute->name, source->name, name_length);
+		}
+		attribute->type = source->type;
+		attribute->index = source->index;
+		attribute->data = decoded ? &entry->accessors[decoded - mesh->attributes] : source->data;
+	}
+
+	/* patch the primitive and register the entry so that cgltf_free releases it */
+	entry->primitive = primitive;
+	entry->original_attributes = primitive->attributes;
+	entry->original_attributes_count = primitive->attributes_count;
+	entry->original_indices = primitive->indices;
+
+	primitive->attributes = entry->attributes;
+	primitive->attributes_count = entry->attributes_count;
+	if (has_indices)
+	{
+		primitive->indices = &entry->accessors[mesh->attributes_count];
+	}
+
+	entry->next = (cgltf_draco_decoded_primitive*)data->draco_decoded;
+	data->draco_decoded = entry;
+	return cgltf_draco_result_success;
+
+fail:
+	cgltf_draco_free_entry(data, entry);
+	return cgltf_draco_result_out_of_memory;
+}
+
+cgltf_draco_result cgltf_decode_draco_primitive(cgltf_data* data, cgltf_primitive* primitive, const cgltf_draco_options* options)
+{
+	if (!data || !primitive)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	if (!primitive->has_draco_mesh_compression)
+	{
+		return cgltf_draco_result_not_compressed;
+	}
+
+	/* decoding is cached: a primitive that was already decoded needs no further work */
+	for (cgltf_draco_decoded_primitive* entry = (cgltf_draco_decoded_primitive*)data->draco_decoded; entry; entry = entry->next)
+	{
+		if (entry->primitive == primitive)
+		{
+			return cgltf_draco_result_success;
+		}
+	}
+
+	if (!options || !options->decode_func)
+	{
+		return cgltf_draco_result_unsupported;
+	}
+
+	cgltf_buffer_view* view = primitive->draco_mesh_compression.buffer_view;
+	if (!view)
+	{
+		return cgltf_draco_result_invalid_arguments;
+	}
+
+	const uint8_t* compressed = NULL;
+	if (view->data)
+	{
+		compressed = (const uint8_t*)view->data;
+	}
+	else
+	{
+		if (!view->buffer || !view->buffer->data)
+		{
+			return cgltf_draco_result_buffer_not_loaded;
+		}
+		if (view->offset > view->buffer->size || view->size > view->buffer->size - view->offset)
+		{
+			return cgltf_draco_result_invalid_arguments;
+		}
+		compressed = (const uint8_t*)view->buffer->data + view->offset;
+	}
+
+	cgltf_draco_mesh mesh;
+	memset(&mesh, 0, sizeof(mesh));
+	mesh.memory = &data->memory;
+
+	cgltf_draco_result result = options->decode_func(options->user_data, data, primitive, compressed, view->size, &mesh);
+	if (result == cgltf_draco_result_success && mesh.out_of_memory)
+	{
+		result = cgltf_draco_result_out_of_memory;
+	}
+	if (result == cgltf_draco_result_success)
+	{
+		result = cgltf_draco_finalize(data, primitive, &mesh);
+	}
+
+	cgltf_draco_mesh_clear(&mesh);
+	return result;
+}
+
 void cgltf_free(cgltf_data* data)
 {
 	if (!data)
 	{
 		return;
+	}
+
+	if (data->draco_decoded)
+	{
+		cgltf_free_draco_decoded(data);
 	}
 
 	void (*file_release)(const struct cgltf_memory_options*, const struct cgltf_file_options*, void* data, cgltf_size size) = data->file.release ? data->file.release : cgltf_default_file_release;

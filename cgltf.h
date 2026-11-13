@@ -866,6 +866,9 @@ cgltf_size cgltf_decode_uri(char* uri);
 
 cgltf_result cgltf_validate(cgltf_data* data);
 
+/* Returns true if the given extension name is listed in extensionsUsed. */
+cgltf_bool cgltf_data_has_extension(const cgltf_data* data, const char* extension_name);
+
 void cgltf_free(cgltf_data* data);
 
 void cgltf_node_transform_local(const cgltf_node* node, cgltf_float* out_matrix);
@@ -1594,8 +1597,126 @@ static cgltf_size cgltf_calc_index_bound(cgltf_buffer_view* buffer_view, cgltf_s
 #define CGLTF_ASSERT_IF(cond, result) if (cond) return result;
 #endif
 
+cgltf_bool cgltf_data_has_extension(const cgltf_data* data, const char* extension_name)
+{
+	for (cgltf_size i = 0; i < data->extensions_used_count; ++i)
+	{
+		if (strcmp(data->extensions_used[i], extension_name) == 0)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static cgltf_bool cgltf_string_array_contains(char* const* strings, cgltf_size count, const char* value)
+{
+	for (cgltf_size i = 0; i < count; ++i)
+	{
+		if (strcmp(strings[i], value) == 0)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Validity of 8/16-bit integer mesh attributes, merging the core glTF 2.0
+ * tables (Sections 3.7.2.1/3.7.2.2) with the extra formats allowed by
+ * KHR_mesh_quantization. Only invoked while the extension is declared, so
+ * extension-only formats are accepted alongside core-legal ones; anything
+ * outside both tables is rejected.
+ *
+ * Quantized elements are read through the same normalized/integer conversion
+ * path as every other accessor, so dequantization requires no extra branch.
+ */
+static cgltf_bool cgltf_quantized_attribute_is_valid(cgltf_attribute_type semantic, cgltf_type type,
+	cgltf_component_type component_type, cgltf_bool normalized, cgltf_bool morph_target)
+{
+	cgltf_bool is_signed = component_type == cgltf_component_type_r_8 ||
+		component_type == cgltf_component_type_r_16;
+	cgltf_bool is_unsigned = component_type == cgltf_component_type_r_8u ||
+		component_type == cgltf_component_type_r_16u;
+
+	if (!is_signed && !is_unsigned)
+	{
+		return 1; /* FLOAT and 32-bit types are handled by the core rules. */
+	}
+
+	if (!morph_target)
+	{
+		switch (semantic)
+		{
+			case cgltf_attribute_type_position:
+				/* Core: FLOAT only. Extension adds every 8/16-bit integer VEC3 format. */
+				return type == cgltf_type_vec3;
+
+			case cgltf_attribute_type_normal:
+				/* BYTE/SHORT normalized, VEC3 (core FLOAT, extension adds these). */
+				return type == cgltf_type_vec3 && is_signed && normalized;
+
+			case cgltf_attribute_type_tangent:
+				/* BYTE/SHORT normalized, VEC4 (core FLOAT, extension adds these). */
+				return type == cgltf_type_vec4 && is_signed && normalized;
+
+			case cgltf_attribute_type_texcoord:
+				/* Core: normalized unsigned VEC2; extension adds unnormalized unsigned
+				 * and both states of signed VEC2, covering every 8/16-bit combination. */
+				return type == cgltf_type_vec2;
+
+			case cgltf_attribute_type_color:
+				/* Core: normalized UNSIGNED_BYTE/UNSIGNED_SHORT VEC3/VEC4. */
+				return (type == cgltf_type_vec3 || type == cgltf_type_vec4) &&
+					is_unsigned && normalized;
+
+			case cgltf_attribute_type_joints:
+				/* Core: unnormalized UNSIGNED_BYTE/UNSIGNED_SHORT VEC4. */
+				return type == cgltf_type_vec4 && is_unsigned && !normalized;
+
+			case cgltf_attribute_type_weights:
+				/* Core: normalized UNSIGNED_BYTE/UNSIGNED_SHORT VEC4. */
+				return type == cgltf_type_vec4 && is_unsigned && normalized;
+
+			default:
+				/* Unknown and custom semantics are not constrained by either table. */
+				return 1;
+		}
+	}
+
+	switch (semantic)
+	{
+		case cgltf_attribute_type_position:
+			/* Extension adds signed BYTE/SHORT VEC3, either normalization state. */
+			return type == cgltf_type_vec3 && is_signed;
+
+		case cgltf_attribute_type_normal:
+			/* BYTE/SHORT normalized VEC3. */
+			return type == cgltf_type_vec3 && is_signed && normalized;
+
+		case cgltf_attribute_type_tangent:
+			/* BYTE/SHORT normalized VEC3 (morph tangents have no W component). */
+			return type == cgltf_type_vec3 && is_signed && normalized;
+
+		case cgltf_attribute_type_texcoord:
+			/* Core morph table: normalized signed/unsigned VEC2; extension adds
+			 * unnormalized signed VEC2. Unsigned stays normalized-only. */
+			return type == cgltf_type_vec2 && (is_signed || normalized);
+
+		case cgltf_attribute_type_color:
+			/* Core morph table: normalized signed/unsigned BYTE/SHORT VEC3/VEC4. */
+			return (type == cgltf_type_vec3 || type == cgltf_type_vec4) && normalized;
+
+		default:
+			/* JOINTS/WEIGHTS and custom semantics have no morph target table row. */
+			return 0;
+	}
+}
+
 cgltf_result cgltf_validate(cgltf_data* data)
 {
+	cgltf_bool has_mesh_quantization = cgltf_data_has_extension(data, "KHR_mesh_quantization");
+
 	for (cgltf_size i = 0; i < data->accessors_count; ++i)
 	{
 		cgltf_accessor* accessor = &data->accessors[i];
@@ -1610,6 +1731,17 @@ cgltf_result cgltf_validate(cgltf_data* data)
 			cgltf_size req_size = accessor->offset + accessor->stride * (accessor->count - 1) + element_size;
 
 			CGLTF_ASSERT_IF(accessor->buffer_view->size < req_size, cgltf_result_data_too_short);
+		}
+
+		/* KHR_mesh_quantization requires 4-byte alignment of every element stored
+		 * in its sub-4-byte integer component types (e.g. a BYTE normal uses stride 4). */
+		if (has_mesh_quantization && accessor->type != cgltf_type_scalar &&
+			(accessor->component_type == cgltf_component_type_r_8 ||
+			accessor->component_type == cgltf_component_type_r_8u ||
+			accessor->component_type == cgltf_component_type_r_16 ||
+			accessor->component_type == cgltf_component_type_r_16u))
+		{
+			CGLTF_ASSERT_IF(accessor->stride % 4 != 0, cgltf_result_invalid_gltf);
 		}
 
 		if (accessor->is_sparse)
@@ -1668,6 +1800,13 @@ cgltf_result cgltf_validate(cgltf_data* data)
 		}
 	}
 
+	/* KHR_mesh_quantization is mandatory rather than optional: a file that lists it in
+	 * extensionsUsed must also list it in extensionsRequired. Scoped to this extension so
+	 * files without it validate exactly as they did before. */
+	CGLTF_ASSERT_IF(has_mesh_quantization &&
+		!cgltf_string_array_contains(data->extensions_required, data->extensions_required_count, "KHR_mesh_quantization"),
+		cgltf_result_invalid_gltf);
+
 	for (cgltf_size i = 0; i < data->meshes_count; ++i)
 	{
 		if (data->meshes[i].weights)
@@ -1693,14 +1832,30 @@ cgltf_result cgltf_validate(cgltf_data* data)
 
 			for (cgltf_size k = 0; k < data->meshes[i].primitives[j].attributes_count; ++k)
 			{
-				CGLTF_ASSERT_IF(data->meshes[i].primitives[j].attributes[k].data->count != first->count, cgltf_result_invalid_gltf);
+				cgltf_attribute* attribute = &data->meshes[i].primitives[j].attributes[k];
+
+				CGLTF_ASSERT_IF(attribute->data->count != first->count, cgltf_result_invalid_gltf);
+
+				if (has_mesh_quantization)
+				{
+					CGLTF_ASSERT_IF(!cgltf_quantized_attribute_is_valid(attribute->type, attribute->data->type,
+						attribute->data->component_type, attribute->data->normalized, 0), cgltf_result_invalid_gltf);
+				}
 			}
 
 			for (cgltf_size k = 0; k < data->meshes[i].primitives[j].targets_count; ++k)
 			{
 				for (cgltf_size m = 0; m < data->meshes[i].primitives[j].targets[k].attributes_count; ++m)
 				{
-					CGLTF_ASSERT_IF(data->meshes[i].primitives[j].targets[k].attributes[m].data->count != first->count, cgltf_result_invalid_gltf);
+					cgltf_attribute* attribute = &data->meshes[i].primitives[j].targets[k].attributes[m];
+
+					CGLTF_ASSERT_IF(attribute->data->count != first->count, cgltf_result_invalid_gltf);
+
+					if (has_mesh_quantization)
+					{
+						CGLTF_ASSERT_IF(!cgltf_quantized_attribute_is_valid(attribute->type, attribute->data->type,
+							attribute->data->component_type, attribute->data->normalized, 1), cgltf_result_invalid_gltf);
+					}
 				}
 			}
 

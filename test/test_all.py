@@ -67,6 +67,12 @@ if __name__ == "__main__":
         print("Error.")
         sys.exit(1)
 
+    result = os.system(get_executable_path("test_quantization"))
+    if result != 0:
+        num_errors = num_errors + 1
+        print("Error.")
+        sys.exit(1)
+
     result = os.system(get_executable_path("test_strings"))
     if result != 0:
         num_errors = num_errors + 1

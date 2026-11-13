@@ -89,6 +89,7 @@ cgltf_size cgltf_write(const cgltf_options* options, char* buffer, cgltf_size si
 #define CGLTF_EXTENSION_FLAG_MATERIALS_DISPERSION (1 << 17)
 #define CGLTF_EXTENSION_FLAG_TEXTURE_WEBP          (1 << 18)
 #define CGLTF_EXTENSION_FLAG_MATERIALS_DIFFUSE_TRANSMISSION (1 << 19)
+#define CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION     (1 << 20)
 
 typedef struct {
 	char* buffer;
@@ -1329,6 +1330,9 @@ static void cgltf_write_extensions(cgltf_write_context* context, uint32_t extens
 	if (extension_flags & CGLTF_EXTENSION_FLAG_MATERIALS_DISPERSION) {
 		cgltf_write_stritem(context, "KHR_materials_dispersion");
 	}
+	if (extension_flags & CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION) {
+		cgltf_write_stritem(context, "KHR_mesh_quantization");
+	}
 }
 
 cgltf_size cgltf_write(const cgltf_options* options, char* buffer, cgltf_size size, const cgltf_data* data)
@@ -1346,6 +1350,17 @@ cgltf_size cgltf_write(const cgltf_options* options, char* buffer, cgltf_size si
 	ctx.needs_comma = 0;
 	ctx.extension_flags = 0;
 	ctx.required_extension_flags = 0;
+
+	/* Preserve parsed top-level extensions; KHR_mesh_quantization carries no
+	 * per-object payload, so the flag is all the writer needs to round-trip it. */
+	if (cgltf_data_has_extension(data, "KHR_mesh_quantization"))
+	{
+		ctx.extension_flags |= CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION;
+	}
+	if (cgltf_string_array_contains(data->extensions_required, data->extensions_required_count, "KHR_mesh_quantization"))
+	{
+		ctx.required_extension_flags |= CGLTF_EXTENSION_FLAG_MESH_QUANTIZATION;
+	}
 
 	cgltf_write_context* context = &ctx;
 

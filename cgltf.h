@@ -151,6 +151,13 @@ typedef struct cgltf_options
 	cgltf_size json_token_count; /* 0 == auto */
 	cgltf_memory_options memory;
 	cgltf_file_options file;
+	/*
+	 * When non-zero, unresolvable or malformed KHR_animation_pointer
+	 * channels make cgltf_parse fail with cgltf_result_invalid_gltf.
+	 * The default (zero) keeps lenient behavior: failed channels are
+	 * retained with a non-valid status and safely ignored.
+	 */
+	cgltf_bool strict_animation_pointers;
 } cgltf_options;
 
 typedef enum cgltf_buffer_view_type
@@ -227,8 +234,61 @@ typedef enum cgltf_animation_path_type {
 	cgltf_animation_path_type_rotation,
 	cgltf_animation_path_type_scale,
 	cgltf_animation_path_type_weights,
+	cgltf_animation_path_type_pointer,
 	cgltf_animation_path_type_max_enum
 } cgltf_animation_path_type;
+
+/*
+ * Object category a KHR_animation_pointer JSON pointer resolves to. The
+ * binding object pointer always points inside one of the cgltf_data arrays.
+ */
+typedef enum cgltf_animation_target_type {
+	cgltf_animation_target_type_invalid,
+	cgltf_animation_target_type_node,
+	cgltf_animation_target_type_material,
+	cgltf_animation_target_type_light,
+	cgltf_animation_target_type_camera,
+	cgltf_animation_target_type_max_enum
+} cgltf_animation_target_type;
+
+/*
+ * Distinguishable resolution status of a KHR_animation_pointer channel.
+ * Everything except cgltf_animation_pointer_status_valid is a failure reason;
+ * in lenient mode failed channels are kept with this status set and are simply
+ * ignored at runtime, while strict parsing fails with cgltf_result_invalid_gltf.
+ */
+typedef enum cgltf_animation_pointer_status {
+	cgltf_animation_pointer_status_valid = 0,
+	cgltf_animation_pointer_status_malformed,        /* not an RFC 6901 pointer or bad escaping */
+	cgltf_animation_pointer_status_unknown_root,     /* top-level object is not animatable/unknown */
+	cgltf_animation_pointer_status_index_out_of_bounds,
+	cgltf_animation_pointer_status_unknown_property, /* valid object, but the property name is not supported */
+	cgltf_animation_pointer_status_property_undefined,/* property is absent and has no spec default */
+	cgltf_animation_pointer_status_duplicate,        /* same property targeted twice in one animation */
+	cgltf_animation_pointer_status_max_enum
+} cgltf_animation_pointer_status;
+
+/*
+ * Resolved KHR_animation_pointer target. The binding is computed once during
+ * cgltf_parse and cached, so runtime sampling never has to parse the pointer
+ * string or allocate memory.
+ *
+ * target_object points at the owning cgltf object (node, material, light or
+ * camera); target_type identifies its dynamic type. target_value points at
+ * the first cgltf_float of the animated property (component_count entries),
+ * except for morph weight elements, where it points at the individual weight.
+ * For unresolved pointers target_object/target_value stay NULL.
+ */
+typedef struct cgltf_animation_pointer_binding {
+	char* pointer; /* raw JSON pointer, owned by the binding */
+	cgltf_size animation_index; /* channel coordinates inside cgltf_data */
+	cgltf_size channel_index;
+	cgltf_animation_target_type target_type;
+	void* target_object;
+	cgltf_float* target_value;
+	cgltf_size component_count; /* 1 for scalar/float[], 2/3/4 for vectors */
+	cgltf_animation_pointer_status status;
+} cgltf_animation_pointer_binding;
 
 typedef enum cgltf_interpolation_type {
 	cgltf_interpolation_type_linear,
@@ -841,6 +901,19 @@ typedef struct cgltf_data
 
 	cgltf_memory_options memory;
 	cgltf_file_options file;
+
+	/*
+	 * KHR_animation_pointer support. The registry holds one resolved binding
+	 * per pointer channel (channel order within animations is preserved).
+	 * pointer_cache is a string-keyed hash table into the registry; identical
+	 * pointer strings share a single entry so repeated lookups at runtime do
+	 * not parse JSON pointers or allocate. Both are NULL when the asset does
+	 * not use the extension.
+	 */
+	cgltf_animation_pointer_binding* animation_pointers;
+	cgltf_size animation_pointers_count;
+	cgltf_size animation_pointer_cache_capacity;
+	cgltf_size* animation_pointer_cache; /* open-addressing table of registry indices */
 } cgltf_data;
 
 cgltf_result cgltf_parse(
@@ -905,6 +978,22 @@ cgltf_size cgltf_scene_index(const cgltf_data* data, const cgltf_scene* object);
 cgltf_size cgltf_animation_index(const cgltf_data* data, const cgltf_animation* object);
 cgltf_size cgltf_animation_sampler_index(const cgltf_animation* animation, const cgltf_animation_sampler* object);
 cgltf_size cgltf_animation_channel_index(const cgltf_animation* animation, const cgltf_animation_channel* object);
+
+/*
+ * Returns the resolved binding of the KHR_animation_pointer channel, or NULL
+ * if the channel does not use the extension. The returned pointer is owned by
+ * cgltf_data and stays valid until cgltf_free.
+ */
+const cgltf_animation_pointer_binding* cgltf_animation_channel_pointer(const cgltf_data* data, const cgltf_animation* animation, const cgltf_animation_channel* channel);
+
+/*
+ * Looks up a previously resolved binding by its raw JSON pointer string. This
+ * never allocates and never parses the pointer: it is a cached hash lookup
+ * intended for per-frame use. Returns NULL for pointers that were not part of
+ * a KHR_animation_pointer channel or that failed resolution; inspect the
+ * channel bindings for failure statuses.
+ */
+const cgltf_animation_pointer_binding* cgltf_animation_pointer_resolve(const cgltf_data* data, const char* pointer);
 
 #ifdef __cplusplus
 }
@@ -1777,6 +1866,25 @@ cgltf_result cgltf_validate(cgltf_data* data)
 		{
 			cgltf_animation_channel* channel = &data->animations[i].channels[j];
 
+			if (channel->target_path == cgltf_animation_path_type_pointer)
+			{
+				const cgltf_animation_pointer_binding* binding =
+					cgltf_animation_channel_pointer(data, &data->animations[i], channel);
+
+				/* Channels without an extension object or with an unresolved
+				 * pointer are intentionally inert and cannot be dimension-checked. */
+				if (!binding || binding->status != cgltf_animation_pointer_status_valid)
+				{
+					continue;
+				}
+
+				cgltf_size values = channel->sampler->interpolation == cgltf_interpolation_type_cubic_spline ? 3 : 1;
+
+				CGLTF_ASSERT_IF(channel->sampler->input->count * binding->component_count * values != channel->sampler->output->count, cgltf_result_invalid_gltf);
+
+				continue;
+			}
+
 			if (!channel->target_node)
 			{
 				continue;
@@ -2128,6 +2236,14 @@ void cgltf_free(cgltf_data* data)
 	}
 
 	data->memory.free_func(data->memory.user_data, data->extensions_required);
+
+	for (cgltf_size i = 0; i < data->animation_pointers_count; ++i)
+	{
+		data->memory.free_func(data->memory.user_data, data->animation_pointers[i].pointer);
+	}
+
+	data->memory.free_func(data->memory.user_data, data->animation_pointers);
+	data->memory.free_func(data->memory.user_data, data->animation_pointer_cache);
 
 	file_release(&data->memory, &data->file, data->file_data, data->file_size);
 
@@ -3102,6 +3218,51 @@ static int cgltf_parse_json_unprocessed_extensions(cgltf_options* options, jsmnt
 		}
 	}
 	return i;
+}
+
+/*
+ * KHR_animation_pointer channels are collected while parsing the JSON (the
+ * rest of the glTF objects, and therefore the pointer targets, do not exist
+ * yet). Each pending entry remembers where the channel lives so the pointers
+ * can be resolved in a single pass after cgltf_fixup_pointers. The owned
+ * pointer strings are moved into the binding registry on success.
+ */
+typedef struct cgltf_pending_animation_pointer {
+	cgltf_size animation_index;
+	cgltf_size channel_index;
+	char* pointer;
+} cgltf_pending_animation_pointer;
+
+typedef struct cgltf_animation_parse_context {
+	cgltf_pending_animation_pointer* pending_pointers;
+	cgltf_size pending_pointers_count;
+	cgltf_size pending_pointers_capacity;
+} cgltf_animation_parse_context;
+
+static int cgltf_animation_parse_context_add(cgltf_options* options, cgltf_animation_parse_context* context, cgltf_size animation_index, cgltf_size channel_index, char* pointer)
+{
+	if (context->pending_pointers_count == context->pending_pointers_capacity)
+	{
+		cgltf_size new_capacity = context->pending_pointers_capacity ? context->pending_pointers_capacity * 2 : 4;
+		cgltf_pending_animation_pointer* new_array = (cgltf_pending_animation_pointer*)cgltf_calloc(options, sizeof(cgltf_pending_animation_pointer), new_capacity);
+		if (!new_array)
+		{
+			return CGLTF_ERROR_NOMEM;
+		}
+		if (context->pending_pointers)
+		{
+			memcpy(new_array, context->pending_pointers, sizeof(cgltf_pending_animation_pointer) * context->pending_pointers_count);
+			options->memory.free_func(options->memory.user_data, context->pending_pointers);
+		}
+		context->pending_pointers = new_array;
+		context->pending_pointers_capacity = new_capacity;
+	}
+
+	cgltf_pending_animation_pointer* entry = &context->pending_pointers[context->pending_pointers_count++];
+	entry->animation_index = animation_index;
+	entry->channel_index = channel_index;
+	entry->pointer = pointer;
+	return 0;
 }
 
 static int cgltf_parse_json_draco_mesh_compression(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_draco_mesh_compression* out_draco_mesh_compression)
@@ -6071,9 +6232,97 @@ static int cgltf_parse_json_animation_sampler(cgltf_options* options, jsmntok_t 
 	return i;
 }
 
-static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation_channel* out_channel)
+/*
+ * Parses the "extensions" object of an animation channel target. The
+ * KHR_animation_pointer extension is consumed here: its "pointer" string is
+ * recorded in the animation parse context, while any other extensions are
+ * kept unprocessed in the channel's generic extension list.
+ */
+static int cgltf_parse_json_animation_target_extensions(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation_channel* out_channel, cgltf_animation_parse_context* parse_context, cgltf_size animation_index, cgltf_size channel_index)
 {
-	(void)options;
+	++i;
+
+	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+
+	int extensions_size = tokens[i].size;
+	++i;
+
+	for (int j = 0; j < extensions_size; ++j)
+	{
+		CGLTF_CHECK_KEY(tokens[i]);
+
+		if (cgltf_json_strcmp(tokens + i, json_chunk, "KHR_animation_pointer") == 0)
+		{
+			++i;
+			CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+
+			int extension_size = tokens[i].size;
+			++i;
+
+			for (int k = 0; k < extension_size; ++k)
+			{
+				CGLTF_CHECK_KEY(tokens[i]);
+
+				if (cgltf_json_strcmp(tokens + i, json_chunk, "pointer") == 0)
+				{
+					char* pointer = NULL;
+					i = cgltf_parse_json_string(options, tokens, i + 1, json_chunk, &pointer);
+					if (i < 0)
+					{
+						return i;
+					}
+
+					int add_result = cgltf_animation_parse_context_add(options, parse_context, animation_index, channel_index, pointer);
+					if (add_result != 0)
+					{
+						options->memory.free_func(options->memory.user_data, pointer);
+						return add_result;
+					}
+				}
+				else
+				{
+					i = cgltf_skip_json(tokens, i + 1);
+				}
+
+				if (i < 0)
+				{
+					return i;
+				}
+			}
+		}
+		else
+		{
+			cgltf_extension single_extension;
+			memset(&single_extension, 0, sizeof(single_extension));
+			i = cgltf_parse_json_unprocessed_extension(options, tokens, i, json_chunk, &single_extension);
+			if (i < 0)
+			{
+				return i;
+			}
+
+			cgltf_extension* new_extensions = (cgltf_extension*)cgltf_calloc(options, sizeof(cgltf_extension), out_channel->extensions_count + 1);
+			if (!new_extensions)
+			{
+				options->memory.free_func(options->memory.user_data, single_extension.name);
+				options->memory.free_func(options->memory.user_data, single_extension.data);
+				return CGLTF_ERROR_NOMEM;
+			}
+			if (out_channel->extensions)
+			{
+				memcpy(new_extensions, out_channel->extensions, sizeof(cgltf_extension) * out_channel->extensions_count);
+				options->memory.free_func(options->memory.user_data, out_channel->extensions);
+			}
+			new_extensions[out_channel->extensions_count] = single_extension;
+			out_channel->extensions = new_extensions;
+			++out_channel->extensions_count;
+		}
+	}
+
+	return i;
+}
+
+static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation_channel* out_channel, cgltf_animation_parse_context* parse_context, cgltf_size animation_index, cgltf_size channel_index)
+{
 	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
 
 	int size = tokens[i].size;
@@ -6127,6 +6376,10 @@ static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t 
 					{
 						out_channel->target_path = cgltf_animation_path_type_weights;
 					}
+					else if (cgltf_json_strcmp(tokens+i, json_chunk, "pointer") == 0)
+					{
+						out_channel->target_path = cgltf_animation_path_type_pointer;
+					}
 					++i;
 				}
 				else if (cgltf_json_strcmp(tokens + i, json_chunk, "extras") == 0)
@@ -6135,7 +6388,7 @@ static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t 
 				}
 				else if (cgltf_json_strcmp(tokens + i, json_chunk, "extensions") == 0)
 				{
-					i = cgltf_parse_json_unprocessed_extensions(options, tokens, i, json_chunk, &out_channel->extensions_count, &out_channel->extensions);
+					i = cgltf_parse_json_animation_target_extensions(options, tokens, i, json_chunk, out_channel, parse_context, animation_index, channel_index);
 				}
 				else
 				{
@@ -6162,7 +6415,7 @@ static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t 
 	return i;
 }
 
-static int cgltf_parse_json_animation(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation* out_animation)
+static int cgltf_parse_json_animation(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation* out_animation, cgltf_animation_parse_context* parse_context, cgltf_size animation_index)
 {
 	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
 
@@ -6204,7 +6457,7 @@ static int cgltf_parse_json_animation(cgltf_options* options, jsmntok_t const* t
 
 			for (cgltf_size k = 0; k < out_animation->channels_count; ++k)
 			{
-				i = cgltf_parse_json_animation_channel(options, tokens, i, json_chunk, &out_animation->channels[k]);
+				i = cgltf_parse_json_animation_channel(options, tokens, i, json_chunk, &out_animation->channels[k], parse_context, animation_index, k);
 				if (i < 0)
 				{
 					return i;
@@ -6233,7 +6486,7 @@ static int cgltf_parse_json_animation(cgltf_options* options, jsmntok_t const* t
 	return i;
 }
 
-static int cgltf_parse_json_animations(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_data* out_data)
+static int cgltf_parse_json_animations(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_data* out_data, cgltf_animation_parse_context* parse_context)
 {
 	i = cgltf_parse_json_array(options, tokens, i, json_chunk, sizeof(cgltf_animation), (void**)&out_data->animations, &out_data->animations_count);
 	if (i < 0)
@@ -6243,7 +6496,7 @@ static int cgltf_parse_json_animations(cgltf_options* options, jsmntok_t const* 
 
 	for (cgltf_size j = 0; j < out_data->animations_count; ++j)
 	{
-		i = cgltf_parse_json_animation(options, tokens, i, json_chunk, &out_data->animations[j]);
+		i = cgltf_parse_json_animation(options, tokens, i, json_chunk, &out_data->animations[j], parse_context, j);
 		if (i < 0)
 		{
 			return i;
@@ -6413,8 +6666,9 @@ cgltf_size cgltf_calc_size(cgltf_type type, cgltf_component_type component_type)
 }
 
 static int cgltf_fixup_pointers(cgltf_data* out_data);
+static cgltf_result cgltf_resolve_animation_pointers(cgltf_options* options, cgltf_data* data, cgltf_animation_parse_context* parse_context);
 
-static int cgltf_parse_json_root(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_data* out_data)
+static int cgltf_parse_json_root(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_data* out_data, cgltf_animation_parse_context* animation_context)
 {
 	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
 
@@ -6485,7 +6739,7 @@ static int cgltf_parse_json_root(cgltf_options* options, jsmntok_t const* tokens
 		}
 		else if (cgltf_json_strcmp(tokens + i, json_chunk, "animations") == 0)
 		{
-			i = cgltf_parse_json_animations(options, tokens, i + 1, json_chunk, out_data);
+			i = cgltf_parse_json_animations(options, tokens, i + 1, json_chunk, out_data, animation_context);
 		}
 		else if (cgltf_json_strcmp(tokens+i, json_chunk, "extras") == 0)
 		{
@@ -6654,12 +6908,20 @@ cgltf_result cgltf_parse_json(cgltf_options* options, const uint8_t* json_chunk,
 	data->memory = options->memory;
 	data->file = options->file;
 
-	int i = cgltf_parse_json_root(options, tokens, 0, json_chunk, data);
+	cgltf_animation_parse_context animation_context;
+	memset(&animation_context, 0, sizeof(animation_context));
+
+	int i = cgltf_parse_json_root(options, tokens, 0, json_chunk, data, &animation_context);
 
 	options->memory.free_func(options->memory.user_data, tokens);
 
 	if (i < 0)
 	{
+		for (cgltf_size p = 0; p < animation_context.pending_pointers_count; ++p)
+		{
+			options->memory.free_func(options->memory.user_data, animation_context.pending_pointers[p].pointer);
+		}
+		options->memory.free_func(options->memory.user_data, animation_context.pending_pointers);
 		cgltf_free(data);
 
 		switch (i)
@@ -6672,12 +6934,29 @@ cgltf_result cgltf_parse_json(cgltf_options* options, const uint8_t* json_chunk,
 
 	if (cgltf_fixup_pointers(data) < 0)
 	{
+		for (cgltf_size p = 0; p < animation_context.pending_pointers_count; ++p)
+		{
+			options->memory.free_func(options->memory.user_data, animation_context.pending_pointers[p].pointer);
+		}
+		options->memory.free_func(options->memory.user_data, animation_context.pending_pointers);
 		cgltf_free(data);
 		return cgltf_result_invalid_gltf;
 	}
 
 	data->json = (const char*)json_chunk;
 	data->json_size = size;
+
+	cgltf_result pointer_result = cgltf_resolve_animation_pointers(options, data, &animation_context);
+
+	/* All pointer strings moved into the registry (or were freed on failure);
+	 * only the pending entry array itself still needs releasing here. */
+	options->memory.free_func(options->memory.user_data, animation_context.pending_pointers);
+
+	if (pointer_result != cgltf_result_success)
+	{
+		cgltf_free(data);
+		return pointer_result;
+	}
 
 	*out_data = data;
 
@@ -6871,6 +7150,1163 @@ static int cgltf_fixup_pointers(cgltf_data* data)
 	}
 
 	return 0;
+}
+
+/*
+ * -- KHR_animation_pointer resolution --
+ *
+ * Pointers are RFC 6901 JSON pointers (e.g.
+ * "/materials/0/pbrMetallicRoughness/baseColorFactor"). Resolution runs once
+ * after all object references have been fixed up; the results are cached so
+ * runtime sampling only performs a hash lookup and never allocates.
+ */
+
+/* Returns the next reference token and advances *cursor; NULL at the end. */
+static const char* cgltf_pointer_next_token(const char** cursor, cgltf_size* out_length)
+{
+	const char* p = *cursor;
+
+	if (*p == 0)
+	{
+		return NULL;
+	}
+
+	if (*p != '/')
+	{
+		return (const char*)~(size_t)0; /* malformed: references must start with '/' */
+	}
+
+	++p;
+	const char* start = p;
+
+	while (*p != 0 && *p != '/')
+	{
+		/* RFC 6901 only allows "~0" and "~1" escape sequences. */
+		if (*p == '~' && p[1] != '0' && p[1] != '1')
+		{
+			return (const char*)~(size_t)0;
+		}
+		++p;
+	}
+
+	*out_length = (cgltf_size)(p - start);
+	*cursor = p;
+	return start;
+}
+
+/* Compares a pointer token (which may contain ~0/~1 escapes) with a literal. */
+static int cgltf_pointer_token_equals(const char* token, cgltf_size length, const char* literal)
+{
+	cgltf_size k = 0;
+
+	for (cgltf_size i = 0; i < length; ++i)
+	{
+		char c = token[i];
+
+		if (c == '~')
+		{
+			++i;
+			if (i >= length)
+			{
+				return 0;
+			}
+			c = token[i] == '0' ? '~' : '/';
+		}
+
+		if (c != literal[k])
+		{
+			return 0;
+		}
+		++k;
+	}
+
+	return literal[k] == 0;
+}
+
+/* Parses an array index token; returns -1 on any deviation from RFC 6901. */
+static int cgltf_pointer_token_to_index(const char* token, cgltf_size length, cgltf_size* out_index)
+{
+	if (length == 0)
+	{
+		return -1;
+	}
+
+	/* "0" is the only index token allowed to start with a zero digit. */
+	if (length > 1 && token[0] == '0')
+	{
+		return -1;
+	}
+
+	cgltf_size value = 0;
+
+	for (cgltf_size i = 0; i < length; ++i)
+	{
+		char c = token[i];
+
+		if (c < '0' || c > '9')
+		{
+			return -1;
+		}
+
+		value = value * 10 + (cgltf_size)(c - '0');
+	}
+
+	*out_index = value;
+	return 0;
+}
+
+/* Binds a scalar/vector float property. */
+static cgltf_animation_pointer_status cgltf_pointer_bind_float(cgltf_animation_pointer_binding* binding, void* object, cgltf_float* value, cgltf_size component_count)
+{
+	binding->target_object = object;
+	binding->target_value = value;
+	binding->component_count = component_count;
+	binding->status = cgltf_animation_pointer_status_valid;
+	return cgltf_animation_pointer_status_valid;
+}
+
+/*
+ * Consumes the shared "extensions/KHR_texture_transform/{offset,rotation,
+ * scale}" tail of a textureInfo pointer. The transform only exists when the
+ * KHR_texture_transform extension is actually present on the texture view.
+ */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_texture_transform(cgltf_animation_pointer_binding* binding, cgltf_texture_view* view, cgltf_bool has_transform, const char** cursor)
+{
+	cgltf_size length = 0;
+	const char* token = cgltf_pointer_next_token(cursor, &length);
+	if (token == (const char*)~(size_t)0 || token == NULL || !cgltf_pointer_token_equals(token, length, "KHR_texture_transform"))
+	{
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	token = cgltf_pointer_next_token(cursor, &length);
+	if (token == (const char*)~(size_t)0 || token == NULL)
+	{
+		return cgltf_animation_pointer_status_malformed;
+	}
+
+	if (!has_transform)
+	{
+		return cgltf_animation_pointer_status_property_undefined;
+	}
+
+	if (cgltf_pointer_token_equals(token, length, "offset"))
+	{
+		return cgltf_pointer_bind_float(binding, view, view->transform.offset, 2);
+	}
+	if (cgltf_pointer_token_equals(token, length, "rotation"))
+	{
+		return cgltf_pointer_bind_float(binding, view, &view->transform.rotation, 1);
+	}
+	if (cgltf_pointer_token_equals(token, length, "scale"))
+	{
+		return cgltf_pointer_bind_float(binding, view, view->transform.scale, 2);
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/* Consumes the tail of a pointer rooted at a textureInfo object. */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_texture_info(cgltf_animation_pointer_binding* binding, cgltf_texture_view* view, const char** cursor)
+{
+	cgltf_size length = 0;
+	const char* token = cgltf_pointer_next_token(cursor, &length);
+	if (token == (const char*)~(size_t)0 || token == NULL)
+	{
+		return cgltf_animation_pointer_status_malformed;
+	}
+
+	if (cgltf_pointer_token_equals(token, length, "extensions"))
+	{
+		return cgltf_pointer_resolve_texture_transform(binding, view, view->has_transform, cursor);
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/*
+ * Handles "extensions/<KHR_materials_...>/..." material pointers. The
+ * extension sub-object must be present in the asset; when it is, cgltf fills
+ * the whole sub-object with spec defaults, so individual properties are
+ * always considered defined.
+ */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_material_extension(cgltf_material* material, const char* extension_token, cgltf_size extension_length, const char** cursor, cgltf_animation_pointer_binding* binding)
+{
+	cgltf_size length = 0;
+	const char* token = cgltf_pointer_next_token(cursor, &length);
+	if (token == (const char*)~(size_t)0 || token == NULL)
+	{
+		return cgltf_animation_pointer_status_malformed;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_clearcoat"))
+	{
+		if (!material->has_clearcoat)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "clearcoatFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->clearcoat.clearcoat_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "clearcoatRoughnessFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->clearcoat.clearcoat_roughness_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "clearcoatNormalTexture"))
+		{
+			if (!material->clearcoat.clearcoat_normal_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			const char* next = cgltf_pointer_next_token(cursor, &length);
+			if (next == (const char*)~(size_t)0 || next == NULL)
+			{
+				return cgltf_animation_pointer_status_malformed;
+			}
+			if (cgltf_pointer_token_equals(next, length, "scale"))
+			{
+				return cgltf_pointer_bind_float(binding, material, &material->clearcoat.clearcoat_normal_texture.scale, 1);
+			}
+			if (cgltf_pointer_token_equals(next, length, "extensions"))
+			{
+				return cgltf_pointer_resolve_texture_transform(binding, &material->clearcoat.clearcoat_normal_texture, material->clearcoat.clearcoat_normal_texture.has_transform, cursor);
+			}
+			return cgltf_animation_pointer_status_unknown_property;
+		}
+		if (cgltf_pointer_token_equals(token, length, "clearcoatTexture"))
+		{
+			if (!material->clearcoat.clearcoat_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->clearcoat.clearcoat_texture, cursor);
+		}
+		if (cgltf_pointer_token_equals(token, length, "clearcoatRoughnessTexture"))
+		{
+			if (!material->clearcoat.clearcoat_roughness_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->clearcoat.clearcoat_roughness_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_ior"))
+	{
+		if (!material->has_ior)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "ior"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->ior.ior, 1);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_specular"))
+	{
+		if (!material->has_specular)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "specularFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->specular.specular_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "specularColorFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, material->specular.specular_color_factor, 3);
+		}
+		if (cgltf_pointer_token_equals(token, length, "specularTexture"))
+		{
+			if (!material->specular.specular_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->specular.specular_texture, cursor);
+		}
+		if (cgltf_pointer_token_equals(token, length, "specularColorTexture"))
+		{
+			if (!material->specular.specular_color_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->specular.specular_color_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_transmission"))
+	{
+		if (!material->has_transmission)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "transmissionFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->transmission.transmission_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "transmissionTexture"))
+		{
+			if (!material->transmission.transmission_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->transmission.transmission_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_volume"))
+	{
+		if (!material->has_volume)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "thicknessFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->volume.thickness_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "attenuationColor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, material->volume.attenuation_color, 3);
+		}
+		if (cgltf_pointer_token_equals(token, length, "attenuationDistance"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->volume.attenuation_distance, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "thicknessTexture"))
+		{
+			if (!material->volume.thickness_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->volume.thickness_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_sheen"))
+	{
+		if (!material->has_sheen)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "sheenColorFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, material->sheen.sheen_color_factor, 3);
+		}
+		if (cgltf_pointer_token_equals(token, length, "sheenRoughnessFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->sheen.sheen_roughness_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "sheenColorTexture"))
+		{
+			if (!material->sheen.sheen_color_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->sheen.sheen_color_texture, cursor);
+		}
+		if (cgltf_pointer_token_equals(token, length, "sheenRoughnessTexture"))
+		{
+			if (!material->sheen.sheen_roughness_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->sheen.sheen_roughness_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_emissive_strength"))
+	{
+		if (!material->has_emissive_strength)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "emissiveStrength"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->emissive_strength.emissive_strength, 1);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_iridescence"))
+	{
+		if (!material->has_iridescence)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "iridescenceFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->iridescence.iridescence_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "iridescenceIor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->iridescence.iridescence_ior, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "iridescenceThicknessMinimum"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->iridescence.iridescence_thickness_min, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "iridescenceThicknessMaximum"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->iridescence.iridescence_thickness_max, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "iridescenceTexture"))
+		{
+			if (!material->iridescence.iridescence_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->iridescence.iridescence_texture, cursor);
+		}
+		if (cgltf_pointer_token_equals(token, length, "iridescenceThicknessTexture"))
+		{
+			if (!material->iridescence.iridescence_thickness_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->iridescence.iridescence_thickness_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_diffuse_transmission"))
+	{
+		if (!material->has_diffuse_transmission)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "diffuseTransmissionFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->diffuse_transmission.diffuse_transmission_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "diffuseTransmissionColorFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, material->diffuse_transmission.diffuse_transmission_color_factor, 3);
+		}
+		if (cgltf_pointer_token_equals(token, length, "diffuseTransmissionTexture"))
+		{
+			if (!material->diffuse_transmission.diffuse_transmission_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->diffuse_transmission.diffuse_transmission_texture, cursor);
+		}
+		if (cgltf_pointer_token_equals(token, length, "diffuseTransmissionColorTexture"))
+		{
+			if (!material->diffuse_transmission.diffuse_transmission_color_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->diffuse_transmission.diffuse_transmission_color_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_anisotropy"))
+	{
+		if (!material->has_anisotropy)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "anisotropyStrength"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->anisotropy.anisotropy_strength, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "anisotropyRotation"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->anisotropy.anisotropy_rotation, 1);
+		}
+		if (cgltf_pointer_token_equals(token, length, "anisotropyTexture"))
+		{
+			if (!material->anisotropy.anisotropy_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &material->anisotropy.anisotropy_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(extension_token, extension_length, "KHR_materials_dispersion"))
+	{
+		if (!material->has_dispersion)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		if (cgltf_pointer_token_equals(token, length, "dispersion"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->dispersion.dispersion, 1);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/* Resolves a property token within a material object. */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_material_property(cgltf_material* material, const char* token, cgltf_size length, const char** cursor, cgltf_animation_pointer_binding* binding)
+{
+	if (cgltf_pointer_token_equals(token, length, "alphaCutoff"))
+	{
+		return cgltf_pointer_bind_float(binding, material, &material->alpha_cutoff, 1);
+	}
+	if (cgltf_pointer_token_equals(token, length, "emissiveFactor"))
+	{
+		return cgltf_pointer_bind_float(binding, material, material->emissive_factor, 3);
+	}
+	if (cgltf_pointer_token_equals(token, length, "normalTexture"))
+	{
+		if (!material->normal_texture.texture)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		const char* next = cgltf_pointer_next_token(cursor, &length);
+		if (next == (const char*)~(size_t)0 || next == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (cgltf_pointer_token_equals(next, length, "scale"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->normal_texture.scale, 1);
+		}
+		if (cgltf_pointer_token_equals(next, length, "extensions"))
+		{
+			return cgltf_pointer_resolve_texture_transform(binding, &material->normal_texture, material->normal_texture.has_transform, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+	if (cgltf_pointer_token_equals(token, length, "occlusionTexture"))
+	{
+		if (!material->occlusion_texture.texture)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		const char* next = cgltf_pointer_next_token(cursor, &length);
+		if (next == (const char*)~(size_t)0 || next == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (cgltf_pointer_token_equals(next, length, "strength"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &material->occlusion_texture.scale, 1);
+		}
+		if (cgltf_pointer_token_equals(next, length, "extensions"))
+		{
+			return cgltf_pointer_resolve_texture_transform(binding, &material->occlusion_texture, material->occlusion_texture.has_transform, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+	if (cgltf_pointer_token_equals(token, length, "emissiveTexture"))
+	{
+		if (!material->emissive_texture.texture)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		return cgltf_pointer_resolve_texture_info(binding, &material->emissive_texture, cursor);
+	}
+	if (cgltf_pointer_token_equals(token, length, "pbrMetallicRoughness"))
+	{
+		const char* next = cgltf_pointer_next_token(cursor, &length);
+		if (next == (const char*)~(size_t)0 || next == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		cgltf_pbr_metallic_roughness* pbr = &material->pbr_metallic_roughness;
+
+		if (cgltf_pointer_token_equals(next, length, "baseColorFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, pbr->base_color_factor, 4);
+		}
+		if (cgltf_pointer_token_equals(next, length, "metallicFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &pbr->metallic_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(next, length, "roughnessFactor"))
+		{
+			return cgltf_pointer_bind_float(binding, material, &pbr->roughness_factor, 1);
+		}
+		if (cgltf_pointer_token_equals(next, length, "baseColorTexture"))
+		{
+			if (!pbr->base_color_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &pbr->base_color_texture, cursor);
+		}
+		if (cgltf_pointer_token_equals(next, length, "metallicRoughnessTexture"))
+		{
+			if (!pbr->metallic_roughness_texture.texture)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_resolve_texture_info(binding, &pbr->metallic_roughness_texture, cursor);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+	if (cgltf_pointer_token_equals(token, length, "extensions"))
+	{
+		const char* extension_token = cgltf_pointer_next_token(cursor, &length);
+		if (extension_token == (const char*)~(size_t)0 || extension_token == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		return cgltf_pointer_resolve_material_extension(material, extension_token, length, cursor, binding);
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/* Resolves the tail of a "/nodes/{}/..." pointer. */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_node_property(cgltf_node* node, const char* token, cgltf_size length, const char** cursor, cgltf_animation_pointer_binding* binding)
+{
+	if (cgltf_pointer_token_equals(token, length, "translation"))
+	{
+		return cgltf_pointer_bind_float(binding, node, node->translation, 3);
+	}
+	if (cgltf_pointer_token_equals(token, length, "rotation"))
+	{
+		/* Per the Object Model, rotation/scale are undefined for matrix nodes. */
+		if (node->has_matrix)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		return cgltf_pointer_bind_float(binding, node, node->rotation, 4);
+	}
+	if (cgltf_pointer_token_equals(token, length, "scale"))
+	{
+		if (node->has_matrix)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		return cgltf_pointer_bind_float(binding, node, node->scale, 3);
+	}
+	if (cgltf_pointer_token_equals(token, length, "weights"))
+	{
+		/* Morph weights are undefined without a mesh that has morph targets. */
+		if (!node->mesh || !node->mesh->primitives_count || !node->mesh->primitives[0].targets_count)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+
+		cgltf_size component_count = node->mesh->primitives[0].targets_count;
+		cgltf_float* weights = node->weights_count ? node->weights : node->mesh->weights;
+
+		cgltf_size element_length = 0;
+		const char* element = cgltf_pointer_next_token(cursor, &element_length);
+		if (element == (const char*)~(size_t)0)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (element == NULL)
+		{
+			if (!weights)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_bind_float(binding, node, weights, component_count);
+		}
+
+		cgltf_size index = 0;
+		if (cgltf_pointer_token_to_index(element, element_length, &index) != 0)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (index >= component_count || !weights)
+		{
+			return cgltf_animation_pointer_status_index_out_of_bounds;
+		}
+		return cgltf_pointer_bind_float(binding, node, &weights[index], 1);
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/* Resolves the tail of a "/extensions/KHR_lights_punctual/lights/{}/..." pointer. */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_light_property(cgltf_light* light, const char* token, cgltf_size length, const char** cursor, cgltf_animation_pointer_binding* binding)
+{
+	if (cgltf_pointer_token_equals(token, length, "color"))
+	{
+		return cgltf_pointer_bind_float(binding, light, light->color, 3);
+	}
+	if (cgltf_pointer_token_equals(token, length, "intensity"))
+	{
+		return cgltf_pointer_bind_float(binding, light, &light->intensity, 1);
+	}
+	if (cgltf_pointer_token_equals(token, length, "range"))
+	{
+		/* range has no spec default: it must be present in the asset. */
+		if (light->range <= 0.0f)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+		return cgltf_pointer_bind_float(binding, light, &light->range, 1);
+	}
+	if (cgltf_pointer_token_equals(token, length, "spot"))
+	{
+		if (light->type != cgltf_light_type_spot)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+
+		const char* next = cgltf_pointer_next_token(cursor, &length);
+		if (next == (const char*)~(size_t)0 || next == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (cgltf_pointer_token_equals(next, length, "innerConeAngle"))
+		{
+			return cgltf_pointer_bind_float(binding, light, &light->spot_inner_cone_angle, 1);
+		}
+		if (cgltf_pointer_token_equals(next, length, "outerConeAngle"))
+		{
+			return cgltf_pointer_bind_float(binding, light, &light->spot_outer_cone_angle, 1);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/* Resolves the tail of a "/cameras/{}/..." pointer. */
+static cgltf_animation_pointer_status cgltf_pointer_resolve_camera_property(cgltf_camera* camera, const char* token, cgltf_size length, const char** cursor, cgltf_animation_pointer_binding* binding)
+{
+	if (cgltf_pointer_token_equals(token, length, "perspective"))
+	{
+		if (camera->type != cgltf_camera_type_perspective)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+
+		cgltf_size property_length = 0;
+		const char* property = cgltf_pointer_next_token(cursor, &property_length);
+		if (property == (const char*)~(size_t)0 || property == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "aspectRatio"))
+		{
+			if (!camera->data.perspective.has_aspect_ratio)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.perspective.aspect_ratio, 1);
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "yfov"))
+		{
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.perspective.yfov, 1);
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "zfar"))
+		{
+			if (!camera->data.perspective.has_zfar)
+			{
+				return cgltf_animation_pointer_status_property_undefined;
+			}
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.perspective.zfar, 1);
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "znear"))
+		{
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.perspective.znear, 1);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	if (cgltf_pointer_token_equals(token, length, "orthographic"))
+	{
+		if (camera->type != cgltf_camera_type_orthographic)
+		{
+			return cgltf_animation_pointer_status_property_undefined;
+		}
+
+		cgltf_size property_length = 0;
+		const char* property = cgltf_pointer_next_token(cursor, &property_length);
+		if (property == (const char*)~(size_t)0 || property == NULL)
+		{
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "xmag"))
+		{
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.orthographic.xmag, 1);
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "ymag"))
+		{
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.orthographic.ymag, 1);
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "zfar"))
+		{
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.orthographic.zfar, 1);
+		}
+		if (cgltf_pointer_token_equals(property, property_length, "znear"))
+		{
+			return cgltf_pointer_bind_float(binding, camera, &camera->data.orthographic.znear, 1);
+		}
+		return cgltf_animation_pointer_status_unknown_property;
+	}
+
+	return cgltf_animation_pointer_status_unknown_property;
+}
+
+/*
+ * Resolves a single raw JSON pointer against the fully fixed-up data. All work
+ * is string scanning with no allocation. On success, *out_end points at the
+ * terminating zero; a non-zero remainder means the pointer had extra tokens.
+ */
+static cgltf_animation_pointer_status cgltf_pointer_resolve(cgltf_data* data, const char* pointer, const char** out_end, cgltf_animation_pointer_binding* binding)
+{
+	const char* cursor = pointer;
+	cgltf_size length = 0;
+	const char* token = cgltf_pointer_next_token(&cursor, &length);
+
+	if (token == (const char*)~(size_t)0 || token == NULL)
+	{
+		*out_end = cursor;
+		return cgltf_animation_pointer_status_malformed;
+	}
+
+	cgltf_animation_pointer_status status;
+
+	if (cgltf_pointer_token_equals(token, length, "nodes"))
+	{
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		cgltf_size index = 0;
+		if (cgltf_pointer_token_to_index(token, length, &index) != 0)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (index >= data->nodes_count)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_index_out_of_bounds;
+		}
+
+		cgltf_node* node = &data->nodes[index];
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		binding->target_type = cgltf_animation_target_type_node;
+		status = cgltf_pointer_resolve_node_property(node, token, length, &cursor, binding);
+		*out_end = cursor;
+		return status;
+	}
+
+	if (cgltf_pointer_token_equals(token, length, "materials"))
+	{
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		cgltf_size index = 0;
+		if (cgltf_pointer_token_to_index(token, length, &index) != 0)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (index >= data->materials_count)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_index_out_of_bounds;
+		}
+
+		cgltf_material* material = &data->materials[index];
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		binding->target_type = cgltf_animation_target_type_material;
+		status = cgltf_pointer_resolve_material_property(material, token, length, &cursor, binding);
+		*out_end = cursor;
+		return status;
+	}
+
+	if (cgltf_pointer_token_equals(token, length, "cameras"))
+	{
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		cgltf_size index = 0;
+		if (cgltf_pointer_token_to_index(token, length, &index) != 0)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (index >= data->cameras_count)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_index_out_of_bounds;
+		}
+
+		cgltf_camera* camera = &data->cameras[index];
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		binding->target_type = cgltf_animation_target_type_camera;
+		status = cgltf_pointer_resolve_camera_property(camera, token, length, &cursor, binding);
+		*out_end = cursor;
+		return status;
+	}
+
+	if (cgltf_pointer_token_equals(token, length, "extensions"))
+	{
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL || !cgltf_pointer_token_equals(token, length, "KHR_lights_punctual"))
+		{
+			*out_end = cursor;
+			return token == (const char*)~(size_t)0 ? cgltf_animation_pointer_status_malformed : cgltf_animation_pointer_status_unknown_property;
+		}
+
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL || !cgltf_pointer_token_equals(token, length, "lights"))
+		{
+			*out_end = cursor;
+			return token == (const char*)~(size_t)0 ? cgltf_animation_pointer_status_malformed : cgltf_animation_pointer_status_unknown_property;
+		}
+
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		cgltf_size index = 0;
+		if (cgltf_pointer_token_to_index(token, length, &index) != 0)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		if (index >= data->lights_count)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_index_out_of_bounds;
+		}
+
+		cgltf_light* light = &data->lights[index];
+		token = cgltf_pointer_next_token(&cursor, &length);
+		if (token == (const char*)~(size_t)0 || token == NULL)
+		{
+			*out_end = cursor;
+			return cgltf_animation_pointer_status_malformed;
+		}
+		binding->target_type = cgltf_animation_target_type_light;
+		status = cgltf_pointer_resolve_light_property(light, token, length, &cursor, binding);
+		*out_end = cursor;
+		return status;
+	}
+
+	*out_end = cursor;
+	return cgltf_animation_pointer_status_unknown_root;
+}
+
+/* FNV-1a 32-bit: deterministic, allocation-free string hashing. */
+static cgltf_size cgltf_animation_pointer_hash(const char* string)
+{
+	cgltf_size hash = 2166136261u;
+
+	while (*string)
+	{
+		hash ^= (cgltf_size)(unsigned char)(*string++);
+		hash *= 16777619u;
+	}
+
+	return hash;
+}
+
+static int cgltf_animation_pointer_strings_equal(const char* a, const char* b)
+{
+	while (*a && *a == *b)
+	{
+		++a;
+		++b;
+	}
+	return *a == *b;
+}
+
+/*
+ * Builds the binding registry and the string-keyed lookup cache from the
+ * pending pointer channels. Called once, after cgltf_fixup_pointers. The
+ * cache table uses open addressing with a power-of-two capacity so the public
+ * per-frame lookup never allocates or scans JSON.
+ */
+static cgltf_result cgltf_resolve_animation_pointers(cgltf_options* options, cgltf_data* data, cgltf_animation_parse_context* parse_context)
+{
+	cgltf_size count = parse_context->pending_pointers_count;
+
+	if (count == 0)
+	{
+		return cgltf_result_success;
+	}
+
+	cgltf_animation_pointer_binding* registry = (cgltf_animation_pointer_binding*)cgltf_calloc(options, sizeof(cgltf_animation_pointer_binding), count);
+	if (!registry)
+	{
+		for (cgltf_size p = 0; p < count; ++p)
+		{
+			options->memory.free_func(options->memory.user_data, parse_context->pending_pointers[p].pointer);
+		}
+		return cgltf_result_out_of_memory;
+	}
+
+	cgltf_size capacity = 4;
+	while (capacity < count * 2)
+	{
+		capacity *= 2;
+	}
+
+	cgltf_size* cache = (cgltf_size*)options->memory.alloc_func(options->memory.user_data, sizeof(cgltf_size) * capacity);
+	if (!cache)
+	{
+		for (cgltf_size p = 0; p < count; ++p)
+		{
+			options->memory.free_func(options->memory.user_data, parse_context->pending_pointers[p].pointer);
+		}
+		options->memory.free_func(options->memory.user_data, registry);
+		return cgltf_result_out_of_memory;
+	}
+	for (cgltf_size i = 0; i < capacity; ++i)
+	{
+		cache[i] = (cgltf_size)(-1);
+	}
+
+	cgltf_bool has_failure = 0;
+
+	for (cgltf_size i = 0; i < count; ++i)
+	{
+		cgltf_pending_animation_pointer* pending = &parse_context->pending_pointers[i];
+		cgltf_animation_pointer_binding* binding = &registry[i];
+
+		/* Ownership of the parsed pointer string moves into the registry. */
+		binding->pointer = pending->pointer;
+		pending->pointer = NULL;
+		binding->animation_index = pending->animation_index;
+		binding->channel_index = pending->channel_index;
+
+		const char* resolve_end = NULL;
+		binding->status = cgltf_pointer_resolve(data, binding->pointer, &resolve_end, binding);
+
+		if (binding->status != cgltf_animation_pointer_status_valid)
+		{
+			has_failure = 1;
+			continue;
+		}
+
+		/* A fully consumed pointer must leave no trailing tokens. */
+		if (resolve_end == NULL || *resolve_end != 0)
+		{
+			binding->target_object = NULL;
+			binding->target_value = NULL;
+			binding->component_count = 0;
+			binding->status = cgltf_animation_pointer_status_unknown_property;
+			has_failure = 1;
+			continue;
+		}
+
+		cgltf_size slot = cgltf_animation_pointer_hash(binding->pointer) & (capacity - 1);
+		while (cache[slot] != (cgltf_size)(-1))
+		{
+			cgltf_animation_pointer_binding* existing = &registry[cache[slot]];
+			if (existing->status == cgltf_animation_pointer_status_valid && cgltf_animation_pointer_strings_equal(existing->pointer, binding->pointer))
+			{
+				/*
+				 * The same property must not be targeted twice in one
+				 * animation. Different channels of different animations may
+				 * still share a pointer and reuse the same cache entry.
+				 */
+				if (pending->animation_index == parse_context->pending_pointers[cache[slot]].animation_index)
+				{
+					binding->target_object = NULL;
+					binding->target_value = NULL;
+					binding->component_count = 0;
+					binding->status = cgltf_animation_pointer_status_duplicate;
+					has_failure = 1;
+				}
+				break;
+			}
+			slot = (slot + 1) & (capacity - 1);
+		}
+
+		if (binding->status == cgltf_animation_pointer_status_valid)
+		{
+			cache[slot] = i;
+		}
+	}
+
+	data->animation_pointers = registry;
+	data->animation_pointers_count = count;
+	data->animation_pointer_cache = cache;
+	data->animation_pointer_cache_capacity = capacity;
+
+	if (has_failure && options->strict_animation_pointers)
+	{
+		return cgltf_result_invalid_gltf;
+	}
+
+	return cgltf_result_success;
+}
+
+const cgltf_animation_pointer_binding* cgltf_animation_channel_pointer(const cgltf_data* data, const cgltf_animation* animation, const cgltf_animation_channel* channel)
+{
+	cgltf_size animation_index = (cgltf_size)(animation - data->animations);
+	cgltf_size channel_index = (cgltf_size)(channel - animation->channels);
+
+	/* Match by channel coordinates so lookups never assume registry density. */
+	for (cgltf_size i = 0; i < data->animation_pointers_count; ++i)
+	{
+		const cgltf_animation_pointer_binding* binding = &data->animation_pointers[i];
+		if (binding->animation_index == animation_index && binding->channel_index == channel_index)
+		{
+			return binding;
+		}
+	}
+
+	return NULL;
+}
+
+const cgltf_animation_pointer_binding* cgltf_animation_pointer_resolve(const cgltf_data* data, const char* pointer)
+{
+	if (!data->animation_pointer_cache || !pointer)
+	{
+		return NULL;
+	}
+
+	cgltf_size capacity = data->animation_pointer_cache_capacity;
+	cgltf_size slot = cgltf_animation_pointer_hash(pointer) & (capacity - 1);
+
+	while (data->animation_pointer_cache[slot] != (cgltf_size)(-1))
+	{
+		const cgltf_animation_pointer_binding* binding = &data->animation_pointers[data->animation_pointer_cache[slot]];
+
+		if (cgltf_animation_pointer_strings_equal(binding->pointer, pointer))
+		{
+			return binding;
+		}
+		slot = (slot + 1) & (capacity - 1);
+	}
+
+	return NULL;
 }
 
 /*

@@ -1,0 +1,1 @@
+/usr/bin/cc -fsanitize=address -Wl,--dependency-file=CMakeFiles/test_animation_pointer.dir/link.d CMakeFiles/test_animation_pointer.dir/test_animation_pointer.c.o -o test_animation_pointer

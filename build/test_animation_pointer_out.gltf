@@ -1,0 +1,322 @@
+{
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 4
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 2
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 3
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 1
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 3
+    }
+  ],
+  "asset": {
+    "version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteLength": 64
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "byteLength": 64
+    }
+  ],
+  "images": [
+    {
+      "uri": "x.png"
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0
+          },
+          "targets": [
+            {
+              "POSITION": 1
+            },
+            {
+              "POSITION": 2
+            }
+          ]
+        }
+      ],
+      "weights": [0.25, 0.75]
+    }
+  ],
+  "materials": [
+    {
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0,
+          "extensions": {
+            "KHR_texture_transform": {
+            }
+          }
+        },
+        "baseColorFactor": [1, 0, 0, 1]
+      },
+      "extensions": {
+        "KHR_materials_ior": {
+        }
+      },
+      "normalTexture": {
+        "index": 0
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "translation": [0, 0, 0],
+      "weights": [0.25, 0.75]
+    },
+    {
+    },
+    {
+      "camera": 0
+    }
+  ],
+  "textures": [
+    {
+      "source": 0
+    }
+  ],
+  "animations": [
+    {
+      "samplers": [
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 4
+        },
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 5
+        },
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 6
+        },
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 7
+        },
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 8
+        },
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 9
+        },
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 10
+        }
+      ],
+      "channels": [
+        {
+          "sampler": 0,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/materials/0/pbrMetallicRoughness/baseColorFactor"
+              }
+            }
+          }
+        },
+        {
+          "sampler": 1,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/materials/0/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset"
+              }
+            }
+          }
+        },
+        {
+          "sampler": 2,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/extensions/KHR_lights_punctual/lights/0/color"
+              }
+            }
+          }
+        },
+        {
+          "sampler": 3,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/cameras/0/perspective/aspectRatio"
+              }
+            }
+          }
+        },
+        {
+          "sampler": 4,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/nodes/0/weights/1"
+              }
+            }
+          }
+        },
+        {
+          "sampler": 5,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/materials/0/extensions/KHR_materials_ior/ior"
+              }
+            }
+          }
+        },
+        {
+          "sampler": 6,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/nodes/0/translation"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "samplers": [
+        {
+          "interpolation": "LINEAR",
+          "input": 3,
+          "output": 4
+        }
+      ],
+      "channels": [
+        {
+          "sampler": 0,
+          "target": {
+            "path": "pointer",
+            "extensions": {
+              "KHR_animation_pointer": {
+                "pointer": "/materials/0/pbrMetallicRoughness/baseColorFactor"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "cameras": [
+    {
+      "type": "perspective",
+      "perspective": {
+        "aspectRatio": 1.5,
+        "yfov": 0.800000012,
+        "zfar": 100,
+        "znear": 0.100000001
+      }
+    }
+  ],
+  "extensions": {
+    "KHR_lights_punctual": {
+      "lights": [
+        {
+          "type": "spot",
+          "intensity": 5,
+          "range": 20,
+          "spot": {
+            "innerConeAngle": 0.200000003,
+            "outerConeAngle": 0.600000024
+          }
+        }
+      ]
+    }
+  },
+  "extensionsUsed": [
+    "KHR_texture_transform",
+    "KHR_lights_punctual",
+    "KHR_materials_ior",
+    "KHR_animation_pointer"
+  ]
+}

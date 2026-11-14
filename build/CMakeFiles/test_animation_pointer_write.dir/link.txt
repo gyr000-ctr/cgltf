@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address -Wl,--dependency-file=CMakeFiles/test_animation_pointer_write.dir/link.d CMakeFiles/test_animation_pointer_write.dir/test_animation_pointer_write.cpp.o -o test_animation_pointer_write

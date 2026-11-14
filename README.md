@@ -103,6 +103,7 @@ cgltf also supports some glTF extensions:
 - EXT_meshopt_compression
 - EXT_texture_webp
 - KHR_draco_mesh_compression (requires a library like [Google's Draco](https://github.com/google/draco) for decompression though)
+- KHR_animation_pointer
 - KHR_lights_punctual
 - KHR_materials_anisotropy
 - KHR_materials_clearcoat

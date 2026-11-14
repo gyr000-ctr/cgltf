@@ -1,0 +1,54 @@
+{
+  "accessors": [
+    {
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 2
+    },
+    {
+      "componentType": 5126,
+      "type": "SCALAR",
+      "count": 2
+    }
+  ],
+  "asset": {
+    "version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteLength": 64
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "byteLength": 64
+    }
+  ],
+  "nodes": [
+    {
+      "translation": [1, 2, 3]
+    }
+  ],
+  "animations": [
+    {
+      "samplers": [
+        {
+          "interpolation": "STEP",
+          "input": 1,
+          "output": 0
+        }
+      ],
+      "channels": [
+        {
+          "sampler": 0,
+          "target": {
+            "node": 0,
+            "path": "translation"
+          }
+        }
+      ]
+    }
+  ]
+}

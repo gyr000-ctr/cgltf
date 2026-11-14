@@ -1,0 +1,1 @@
+/usr/bin/cc -g -fsanitize=address -Wl,--dependency-file=CMakeFiles/test_glb64.dir/link.d CMakeFiles/test_glb64.dir/test_glb64.c.o -o test_glb64

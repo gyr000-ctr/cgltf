@@ -89,6 +89,7 @@ Note that cgltf does not write the contents of extra files such as buffers or im
 ## Features
 cgltf supports core glTF 2.0:
 - glb (binary files) and gltf (JSON files)
+- GLB container versions 2 (32-bit chunk lengths) and 3 (64-bit chunk lengths, glTF 2.1), exposed through `cgltf_data::glb`
 - meshes (including accessors, buffer views, buffers)
 - materials (including textures, samplers, images)
 - scenes and nodes

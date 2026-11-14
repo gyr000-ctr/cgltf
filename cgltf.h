@@ -116,6 +116,46 @@ typedef enum cgltf_file_type
 	cgltf_file_type_max_enum
 } cgltf_file_type;
 
+/* GLB container version stored in the binary header (cgltf_glb_data::version). */
+typedef enum cgltf_glb_version
+{
+	cgltf_glb_version_invalid = 0,
+	cgltf_glb_version_2 = 2, /* 32-bit chunk lengths, 12-byte header, 8-byte chunk headers */
+	cgltf_glb_version_3 = 3, /* 64-bit chunk lengths, 16-byte header, 16-byte chunk headers */
+	cgltf_glb_version_max_enum
+} cgltf_glb_version;
+
+/* Chunk types defined by the GLB specification; other values are permitted by GLBv3. */
+typedef enum cgltf_glb_chunk_type
+{
+	cgltf_glb_chunk_type_json = 0x4E4F534A, /* "JSON" */
+	cgltf_glb_chunk_type_bin = 0x004E4942   /* "BIN\0" */
+} cgltf_glb_chunk_type;
+
+/*
+ * Describes a single chunk of a GLB container. The data pointer is borrowed
+ * from the buffer passed to cgltf_parse (or from the file read callback for
+ * cgltf_parse_file); it stays valid until cgltf_free and is never copied.
+ */
+typedef struct cgltf_glb_chunk
+{
+	cgltf_uint type;       /* chunkType, e.g. cgltf_glb_chunk_type_json / cgltf_glb_chunk_type_bin */
+	cgltf_uint encoding;   /* chunkEncoding; always 0 for GLBv2, 0 means plain/unencoded in GLBv3 */
+	const void* data;      /* pointer to chunk data inside the parsed container, NULL if none */
+	cgltf_size size;       /* chunkLength in bytes (excludes alignment padding) */
+	cgltf_size offset;     /* offset of chunk data from the start of the container */
+} cgltf_glb_chunk;
+
+/* GLB container metadata; glb_version is cgltf_glb_version_invalid for standalone .gltf files. */
+typedef struct cgltf_glb_data
+{
+	cgltf_glb_version version;
+	cgltf_size header_size;       /* 12 for GLBv2, 16 for GLBv3 */
+	cgltf_size total_length;      /* container length as declared in the size header */
+	cgltf_glb_chunk* chunks;      /* all chunks in file order */
+	cgltf_size chunks_count;
+} cgltf_glb_data;
+
 typedef enum cgltf_result
 {
 	cgltf_result_success,
@@ -128,6 +168,9 @@ typedef enum cgltf_result
 	cgltf_result_io_error,
 	cgltf_result_out_of_memory,
 	cgltf_result_legacy_gltf,
+	cgltf_result_invalid_glb,
+	cgltf_result_unknown_encoding,
+	cgltf_result_unsupported_glb_version,
     cgltf_result_max_enum
 } cgltf_result;
 
@@ -278,6 +321,8 @@ typedef struct cgltf_buffer
 	char* uri;
 	void* data; /* loaded by cgltf_load_buffers */
 	cgltf_data_free_method data_free_method;
+	cgltf_bool has_chunk; /* GLBv3: buffer.chunk property is present */
+	cgltf_int chunk;      /* GLBv3: index of the GLB chunk referenced by buffer.chunk */
 	cgltf_extras extras;
 	cgltf_size extensions_count;
 	cgltf_extension* extensions;
@@ -839,6 +884,8 @@ typedef struct cgltf_data
 	const void* bin;
 	cgltf_size bin_size;
 
+	cgltf_glb_data glb; /* GLB container metadata (chunks, container version); empty for .gltf */
+
 	cgltf_memory_options memory;
 	cgltf_file_options file;
 } cgltf_data;
@@ -986,10 +1033,17 @@ static int jsmn_parse(jsmn_parser *parser, const char *js, size_t len, jsmntok_t
 #ifndef CGLTF_CONSTS
 #define GlbHeaderSize 12
 #define GlbChunkHeaderSize 8
+#define GlbHeaderSizeV3 16
+#define GlbChunkHeaderSizeV3 16
+#define GlbChunkAlignmentV3 8
 static const uint32_t GlbVersion = 2;
+static const uint32_t GlbVersionV3 = 3;
 static const uint32_t GlbMagic = 0x46546C67;
 static const uint32_t GlbMagicJsonChunk = 0x4E4F534A;
 static const uint32_t GlbMagicBinChunk = 0x004E4942;
+static const uint32_t GlbEncodingPlain = 0x00000000;
+/* GLBv3 length fields reserve the most significant bit, limiting sizes to 8 EiB. */
+#define GlbLengthMaxV3 (((cgltf_size)1 << (sizeof(cgltf_size) * 8 - 1)) - 1)
 #define CGLTF_CONSTS
 #endif
 
@@ -1112,6 +1166,262 @@ static void cgltf_default_file_release(const struct cgltf_memory_options* memory
 
 static cgltf_result cgltf_parse_json(cgltf_options* options, const uint8_t* json_chunk, cgltf_size size, cgltf_data** out_data);
 
+/* Reads a little-endian uint32 from the container without alignment assumptions. */
+static uint32_t cgltf_read_uint32(const uint8_t* ptr)
+{
+	uint32_t value;
+	memcpy(&value, ptr, sizeof(value));
+	return value;
+}
+
+/* Reads a little-endian uint64 from the container without alignment assumptions. */
+static uint64_t cgltf_read_uint64(const uint8_t* ptr)
+{
+	uint64_t value;
+	memcpy(&value, ptr, sizeof(value));
+	return value;
+}
+
+/*
+ * Walks every chunk of a GLBv3 (64-bit) container and records it in out_chunks.
+ * All chunk data pointers are borrowed from the input buffer; nothing is copied.
+ * The returned JSON chunk is the first chunk whose type is JSON, as required by
+ * the glTF 2.1 binary container specification.
+ */
+static cgltf_result cgltf_parse_glb_v3_chunks(cgltf_options* options, const uint8_t* ptr, cgltf_size size,
+	cgltf_size total_length, cgltf_glb_chunk** out_chunks, cgltf_size* out_chunks_count,
+	const uint8_t** out_json_chunk, cgltf_size* out_json_length,
+	const void** out_bin, cgltf_size* out_bin_size)
+{
+	cgltf_size cursor = GlbHeaderSizeV3;
+	cgltf_size capacity = 0;
+	cgltf_size count = 0;
+	cgltf_glb_chunk* chunks = NULL;
+	const uint8_t* json_chunk = NULL;
+	cgltf_size json_length = 0;
+	const void* bin = NULL;
+	cgltf_size bin_size = 0;
+	int json_seen = 0;
+
+	while (cursor < total_length)
+	{
+		/* Each chunk starts on an 8-byte boundary; skip alignment padding. */
+		cgltf_size aligned = (cursor + (GlbChunkAlignmentV3 - 1)) & ~((cgltf_size)GlbChunkAlignmentV3 - 1);
+		if (aligned < cursor || aligned + GlbChunkHeaderSizeV3 > size || aligned + GlbChunkHeaderSizeV3 > total_length)
+		{
+			break;
+		}
+		cursor = aligned;
+		uint32_t chunk_type = cgltf_read_uint32(ptr + cursor);
+		uint32_t chunk_encoding = cgltf_read_uint32(ptr + cursor + 4);
+		uint64_t chunk_length_64 = cgltf_read_uint64(ptr + cursor + 8);
+
+		/* The most significant bit of every 64-bit length field MUST be zero. */
+		if (chunk_length_64 > GlbLengthMaxV3)
+		{
+			options->memory.free_func(options->memory.user_data, chunks);
+			return cgltf_result_invalid_glb;
+		}
+
+		cgltf_size chunk_length = (cgltf_size)chunk_length_64;
+		cgltf_size data_offset = cursor + GlbChunkHeaderSizeV3;
+
+		/*
+		 * Overflow-safe bounds checks. The header fit check above guarantees
+		 * data_offset <= size and data_offset <= total_length, so subtracting
+		 * it here cannot underflow; this also validates data_offset + chunk_length.
+		 */
+		if (chunk_length > size - data_offset || chunk_length > total_length - data_offset)
+		{
+			options->memory.free_func(options->memory.user_data, chunks);
+			return cgltf_result_data_too_short;
+		}
+
+		/* A zero-length chunk would never advance the cursor; reject it as malformed. */
+		if (chunk_length == 0)
+		{
+			options->memory.free_func(options->memory.user_data, chunks);
+			return cgltf_result_invalid_glb;
+		}
+
+		/* Clients MUST refuse chunks (and therefore files) using an unknown encoding. */
+		if (chunk_encoding != GlbEncodingPlain)
+		{
+			options->memory.free_func(options->memory.user_data, chunks);
+			return cgltf_result_unknown_encoding;
+		}
+
+		if (count == capacity)
+		{
+			cgltf_size new_capacity = capacity ? capacity * 2 : 4;
+			if (new_capacity < capacity || new_capacity > (size / GlbChunkHeaderSizeV3) + 1)
+			{
+				new_capacity = (size / GlbChunkHeaderSizeV3) + 1;
+			}
+			if (new_capacity == capacity)
+			{
+				options->memory.free_func(options->memory.user_data, chunks);
+				return cgltf_result_out_of_memory;
+			}
+			cgltf_glb_chunk* new_chunks = (cgltf_glb_chunk*)options->memory.alloc_func(options->memory.user_data, new_capacity * sizeof(cgltf_glb_chunk));
+			if (!new_chunks)
+			{
+				options->memory.free_func(options->memory.user_data, chunks);
+				return cgltf_result_out_of_memory;
+			}
+			if (chunks)
+			{
+				memcpy(new_chunks, chunks, count * sizeof(cgltf_glb_chunk));
+				options->memory.free_func(options->memory.user_data, chunks);
+			}
+			chunks = new_chunks;
+			capacity = new_capacity;
+		}
+
+		chunks[count].type = chunk_type;
+		chunks[count].encoding = chunk_encoding;
+		chunks[count].data = ptr + data_offset;
+		chunks[count].size = chunk_length;
+		chunks[count].offset = data_offset;
+		++count;
+
+		if (chunk_type == GlbMagicJsonChunk && !json_seen)
+		{
+			json_seen = 1;
+			json_chunk = ptr + data_offset;
+			json_length = chunk_length;
+		}
+		else if (chunk_type == GlbMagicBinChunk && bin == NULL)
+		{
+			bin = ptr + data_offset;
+			bin_size = chunk_length;
+		}
+
+		/* The bounds checks above guarantee this addition cannot wrap or overrun. */
+		cursor = data_offset + chunk_length;
+	}
+
+	if (!json_seen)
+	{
+		options->memory.free_func(options->memory.user_data, chunks);
+		return cgltf_result_invalid_glb;
+	}
+
+	*out_chunks = chunks;
+	*out_chunks_count = count;
+	*out_json_chunk = json_chunk;
+	*out_json_length = json_length;
+	*out_bin = bin;
+	*out_bin_size = bin_size;
+	return cgltf_result_success;
+}
+
+/*
+ * Parses a legacy GLBv2 container. The checks follow the original cgltf behavior
+ * exactly so that 32-bit GLB inputs keep their byte-level parsing semantics;
+ * chunk metadata is additionally recorded for the public cgltf_glb_data API.
+ */
+static cgltf_result cgltf_parse_glb_v2(cgltf_options* options, const uint8_t* ptr, cgltf_size size,
+	cgltf_glb_chunk** out_chunks, cgltf_size* out_chunks_count,
+	const uint8_t** out_json_chunk, cgltf_size* out_json_length,
+	const void** out_bin, cgltf_size* out_bin_size, cgltf_size* out_total_length)
+{
+	// Total length
+	uint32_t tmp;
+	memcpy(&tmp, ptr + 8, 4);
+	if (tmp > size)
+	{
+		return cgltf_result_data_too_short;
+	}
+	cgltf_size total_length = tmp;
+	*out_total_length = total_length;
+
+	const uint8_t* json_chunk = ptr + GlbHeaderSize;
+
+	if (GlbHeaderSize + GlbChunkHeaderSize > size)
+	{
+		return cgltf_result_data_too_short;
+	}
+
+	// JSON chunk: length
+	uint32_t json_length;
+	memcpy(&json_length, json_chunk, 4);
+	if (json_length > size - GlbHeaderSize - GlbChunkHeaderSize)
+	{
+		return cgltf_result_data_too_short;
+	}
+
+	// JSON chunk: magic
+	memcpy(&tmp, json_chunk + 4, 4);
+	if (tmp != GlbMagicJsonChunk)
+	{
+		return cgltf_result_unknown_format;
+	}
+
+	json_chunk += GlbChunkHeaderSize;
+
+	const void* bin = NULL;
+	cgltf_size bin_size = 0;
+	cgltf_size chunks_count = 1;
+
+	if (GlbChunkHeaderSize <= size - GlbHeaderSize - GlbChunkHeaderSize - json_length)
+	{
+		// We can read another chunk
+		const uint8_t* bin_chunk = json_chunk + json_length;
+
+		// Bin chunk: length
+		uint32_t bin_length;
+		memcpy(&bin_length, bin_chunk, 4);
+		if (bin_length > size - GlbHeaderSize - GlbChunkHeaderSize - json_length - GlbChunkHeaderSize)
+		{
+			return cgltf_result_data_too_short;
+		}
+
+		// Bin chunk: magic
+		memcpy(&tmp, bin_chunk + 4, 4);
+		if (tmp != GlbMagicBinChunk)
+		{
+			return cgltf_result_unknown_format;
+		}
+
+		bin_chunk += GlbChunkHeaderSize;
+
+		bin = bin_chunk;
+		bin_size = bin_length;
+		chunks_count = 2;
+	}
+
+	cgltf_glb_chunk* chunks = (cgltf_glb_chunk*)options->memory.alloc_func(options->memory.user_data, chunks_count * sizeof(cgltf_glb_chunk));
+	if (!chunks)
+	{
+		return cgltf_result_out_of_memory;
+	}
+	memset(chunks, 0, chunks_count * sizeof(cgltf_glb_chunk));
+
+	chunks[0].type = GlbMagicJsonChunk;
+	chunks[0].encoding = GlbEncodingPlain;
+	chunks[0].data = json_chunk;
+	chunks[0].size = json_length;
+	chunks[0].offset = (cgltf_size)(json_chunk - ptr);
+
+	if (bin)
+	{
+		chunks[1].type = GlbMagicBinChunk;
+		chunks[1].encoding = GlbEncodingPlain;
+		chunks[1].data = bin;
+		chunks[1].size = bin_size;
+		chunks[1].offset = (cgltf_size)((const uint8_t*)bin - ptr);
+	}
+
+	*out_chunks = chunks;
+	*out_chunks_count = chunks_count;
+	*out_json_chunk = json_chunk;
+	*out_json_length = json_length;
+	*out_bin = bin;
+	*out_bin_size = bin_size;
+	return cgltf_result_success;
+}
+
 cgltf_result cgltf_parse(const cgltf_options* options, const void* data, cgltf_size size, cgltf_data** out_data)
 {
 	if (size < GlbHeaderSize)
@@ -1166,80 +1476,80 @@ cgltf_result cgltf_parse(const cgltf_options* options, const void* data, cgltf_s
 	// Version
 	memcpy(&tmp, ptr + 4, 4);
 	uint32_t version = tmp;
-	if (version != GlbVersion)
+
+	cgltf_glb_version glb_version;
+	if (version == GlbVersion)
 	{
-		return version < GlbVersion ? cgltf_result_legacy_gltf : cgltf_result_unknown_format;
+		glb_version = cgltf_glb_version_2;
+	}
+	else if (version == GlbVersionV3)
+	{
+		glb_version = cgltf_glb_version_3;
+	}
+	else
+	{
+		return version < GlbVersion ? cgltf_result_legacy_gltf : cgltf_result_unsupported_glb_version;
 	}
 
-	// Total length
-	memcpy(&tmp, ptr + 8, 4);
-	if (tmp > size)
-	{
-		return cgltf_result_data_too_short;
-	}
-
-	const uint8_t* json_chunk = ptr + GlbHeaderSize;
-
-	if (GlbHeaderSize + GlbChunkHeaderSize > size)
-	{
-		return cgltf_result_data_too_short;
-	}
-
-	// JSON chunk: length
-	uint32_t json_length;
-	memcpy(&json_length, json_chunk, 4);
-	if (json_length > size - GlbHeaderSize - GlbChunkHeaderSize)
-	{
-		return cgltf_result_data_too_short;
-	}
-
-	// JSON chunk: magic
-	memcpy(&tmp, json_chunk + 4, 4);
-	if (tmp != GlbMagicJsonChunk)
-	{
-		return cgltf_result_unknown_format;
-	}
-
-	json_chunk += GlbChunkHeaderSize;
-
+	cgltf_glb_chunk* chunks = NULL;
+	cgltf_size chunks_count = 0;
+	const uint8_t* json_chunk = NULL;
+	cgltf_size json_length = 0;
 	const void* bin = NULL;
 	cgltf_size bin_size = 0;
+	cgltf_size total_length = 0;
+	cgltf_size header_size = GlbHeaderSize;
+	cgltf_result glb_result;
 
-	if (GlbChunkHeaderSize <= size - GlbHeaderSize - GlbChunkHeaderSize - json_length)
+	if (glb_version == cgltf_glb_version_2)
 	{
-		// We can read another chunk
-		const uint8_t* bin_chunk = json_chunk + json_length;
+		glb_result = cgltf_parse_glb_v2(&fixed_options, ptr, size, &chunks, &chunks_count,
+			&json_chunk, &json_length, &bin, &bin_size, &total_length);
+	}
+	else
+	{
+		header_size = GlbHeaderSizeV3;
 
-		// Bin chunk: length
-		uint32_t bin_length;
-		memcpy(&bin_length, bin_chunk, 4);
-		if (bin_length > size - GlbHeaderSize - GlbChunkHeaderSize - json_length - GlbChunkHeaderSize)
+		if (size < GlbHeaderSizeV3)
 		{
 			return cgltf_result_data_too_short;
 		}
 
-		// Bin chunk: magic
-		memcpy(&tmp, bin_chunk + 4, 4);
-		if (tmp != GlbMagicBinChunk)
+		uint64_t total_length_64 = cgltf_read_uint64(ptr + 8);
+		if (total_length_64 > GlbLengthMaxV3)
 		{
-			return cgltf_result_unknown_format;
+			return cgltf_result_invalid_glb;
+		}
+		total_length = (cgltf_size)total_length_64;
+		if (total_length > size || total_length < GlbHeaderSizeV3)
+		{
+			return cgltf_result_data_too_short;
 		}
 
-		bin_chunk += GlbChunkHeaderSize;
+		glb_result = cgltf_parse_glb_v3_chunks(&fixed_options, ptr, size, total_length,
+			&chunks, &chunks_count, &json_chunk, &json_length, &bin, &bin_size);
+	}
 
-		bin = bin_chunk;
-		bin_size = bin_length;
+	if (glb_result != cgltf_result_success)
+	{
+		return glb_result;
 	}
 
 	cgltf_result json_result = cgltf_parse_json(&fixed_options, json_chunk, json_length, out_data);
 	if (json_result != cgltf_result_success)
 	{
+		fixed_options.memory.free_func(fixed_options.memory.user_data, chunks);
 		return json_result;
 	}
 
 	(*out_data)->file_type = cgltf_file_type_glb;
 	(*out_data)->bin = bin;
 	(*out_data)->bin_size = bin_size;
+	(*out_data)->glb.version = glb_version;
+	(*out_data)->glb.header_size = header_size;
+	(*out_data)->glb.total_length = total_length;
+	(*out_data)->glb.chunks = chunks;
+	(*out_data)->glb.chunks_count = chunks_count;
 
 	return cgltf_result_success;
 }
@@ -1485,6 +1795,33 @@ cgltf_result cgltf_load_buffers(const cgltf_options* options, cgltf_data* data, 
 	if (options == NULL)
 	{
 		return cgltf_result_invalid_options;
+	}
+
+	/* GLBv3: buffers may explicitly reference any chunk via the buffer.chunk property. */
+	for (cgltf_size i = 0; i < data->buffers_count; ++i)
+	{
+		cgltf_buffer* buffer = &data->buffers[i];
+
+		if (buffer->data || !buffer->has_chunk)
+		{
+			continue;
+		}
+
+		if (buffer->chunk < 0 || (cgltf_size)buffer->chunk >= data->glb.chunks_count)
+		{
+			return cgltf_result_invalid_gltf;
+		}
+
+		cgltf_glb_chunk* chunk = &data->glb.chunks[buffer->chunk];
+
+		if (chunk->size < buffer->size)
+		{
+			return cgltf_result_data_too_short;
+		}
+
+		/* Borrowed from the parsed container; no copy and no free method needed. */
+		buffer->data = (void*)chunk->data;
+		buffer->data_free_method = cgltf_data_free_method_none;
 	}
 
 	if (data->buffers_count && data->buffers[0].data == NULL && data->buffers[0].uri == NULL && data->bin)
@@ -2128,6 +2465,9 @@ void cgltf_free(cgltf_data* data)
 	}
 
 	data->memory.free_func(data->memory.user_data, data->extensions_required);
+
+	/* Chunk data is borrowed from file_data; only the metadata array is owned here. */
+	data->memory.free_func(data->memory.user_data, data->glb.chunks);
 
 	file_release(&data->memory, &data->file, data->file_data, data->file_size);
 
@@ -5309,6 +5649,13 @@ static int cgltf_parse_json_buffer(cgltf_options* options, jsmntok_t const* toke
 		else if (cgltf_json_strcmp(tokens+i, json_chunk, "uri") == 0)
 		{
 			i = cgltf_parse_json_string(options, tokens, i + 1, json_chunk, &out_buffer->uri);
+		}
+		else if (cgltf_json_strcmp(tokens+i, json_chunk, "chunk") == 0)
+		{
+			++i;
+			out_buffer->has_chunk = 1;
+			out_buffer->chunk = cgltf_json_to_int(tokens + i, json_chunk);
+			++i;
 		}
 		else if (cgltf_json_strcmp(tokens + i, json_chunk, "extras") == 0)
 		{

@@ -99,6 +99,7 @@ cgltf supports core glTF 2.0:
 - extras data
 
 cgltf also supports some glTF extensions:
+- KHR_animation_pointer
 - EXT_mesh_gpu_instancing
 - EXT_meshopt_compression
 - EXT_texture_webp

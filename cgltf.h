@@ -227,8 +227,22 @@ typedef enum cgltf_animation_path_type {
 	cgltf_animation_path_type_rotation,
 	cgltf_animation_path_type_scale,
 	cgltf_animation_path_type_weights,
+	cgltf_animation_path_type_pointer, /* KHR_animation_pointer */
 	cgltf_animation_path_type_max_enum
 } cgltf_animation_path_type;
+
+/*
+ * Describes the root object of a KHR_animation_pointer JSON pointer.
+ */
+typedef enum cgltf_animation_pointer_type {
+	cgltf_animation_pointer_type_invalid,
+	cgltf_animation_pointer_type_node, /* /nodes/{} */
+	cgltf_animation_pointer_type_mesh, /* /meshes/{} */
+	cgltf_animation_pointer_type_camera, /* /cameras/{} */
+	cgltf_animation_pointer_type_material, /* /materials/{} */
+	cgltf_animation_pointer_type_light, /* /extensions/KHR_lights_punctual/lights/{} */
+	cgltf_animation_pointer_type_max_enum
+} cgltf_animation_pointer_type;
 
 typedef enum cgltf_interpolation_type {
 	cgltf_interpolation_type_linear,
@@ -731,10 +745,31 @@ typedef struct cgltf_animation_sampler {
 	cgltf_extension* extensions;
 } cgltf_animation_sampler;
 
+typedef struct cgltf_animation_pointer {
+	/* Raw JSON pointer (RFC 6901) exactly as written in the extension, e.g. "/nodes/0/rotation". */
+	char* pointer;
+	/* Root object kind the pointer resolves to; invalid when the pointer failed to resolve. */
+	cgltf_animation_pointer_type type;
+	/* Resolved root object; exactly one of these is non-NULL when resolved is true. */
+	cgltf_node* node;
+	cgltf_mesh* mesh;
+	cgltf_camera* camera;
+	cgltf_material* material;
+	cgltf_light* light;
+	/* Accessor type the sampler output must have (scalar for all but node TRS). */
+	cgltf_type component_type;
+	/* Component index for per-component pointers (e.g. baseColorFactor/2); -1 for whole-property pointers. */
+	cgltf_int component_index;
+	/* True once the pointer resolved to a known mutable property. */
+	cgltf_bool resolved;
+} cgltf_animation_pointer;
+
 typedef struct cgltf_animation_channel {
 	cgltf_animation_sampler* sampler;
 	cgltf_node* target_node;
 	cgltf_animation_path_type target_path;
+	cgltf_bool has_animation_pointer; /* KHR_animation_pointer */
+	cgltf_animation_pointer animation_pointer;
 	cgltf_extras extras;
 	cgltf_size extensions_count;
 	cgltf_extension* extensions;
@@ -1777,6 +1812,28 @@ cgltf_result cgltf_validate(cgltf_data* data)
 		{
 			cgltf_animation_channel* channel = &data->animations[i].channels[j];
 
+			if (channel->has_animation_pointer)
+			{
+				cgltf_animation_pointer* pointer = &channel->animation_pointer;
+
+				/* Unresolvable pointers are rejected during parsing; guard anyway. */
+				CGLTF_ASSERT_IF(!pointer->resolved, cgltf_result_invalid_gltf);
+
+				/* Target type must match the sampler output accessor type. */
+				CGLTF_ASSERT_IF(channel->sampler->output->type != pointer->component_type, cgltf_result_invalid_gltf);
+
+				/*
+				 * The output accessor holds one element of the target type per
+				 * input keyframe (three when CUBICSPLINE: in-tangent, value,
+				 * out-tangent). Accessor count counts elements, not components.
+				 */
+				cgltf_size values = channel->sampler->interpolation == cgltf_interpolation_type_cubic_spline ? 3 : 1;
+
+				CGLTF_ASSERT_IF(channel->sampler->input->count * values != channel->sampler->output->count, cgltf_result_invalid_gltf);
+
+				continue;
+			}
+
 			if (!channel->target_node)
 			{
 				continue;
@@ -2092,6 +2149,7 @@ void cgltf_free(cgltf_data* data)
 
 		for (cgltf_size j = 0; j <  data->animations[i].channels_count; ++j)
 		{
+			data->memory.free_func(data->memory.user_data, data->animations[i].channels[j].animation_pointer.pointer);
 			cgltf_free_extensions(data, data->animations[i].channels[j].extensions, data->animations[i].channels[j].extensions_count);
 			cgltf_free_extras(data, &data->animations[i].channels[j].extras);
 		}
@@ -6071,9 +6129,167 @@ static int cgltf_parse_json_animation_sampler(cgltf_options* options, jsmntok_t 
 	return i;
 }
 
+/*
+ * KHR_animation_pointer: splits a RFC 6901 JSON pointer into reference tokens.
+ * Tokens are unescaped (~1 -> /, ~0 -> ~) into caller-provided storage.
+ * Returns the number of tokens, or a negative value on malformed input.
+ */
+typedef struct cgltf_pointer_token {
+	const char* data;
+	cgltf_size size;
+} cgltf_pointer_token;
+
+static int cgltf_pointer_unescape(char* token)
+{
+	/* Unescaping never grows the string; rewrite in place. */
+	char* write = token;
+	char* read = token;
+
+	while (*read)
+	{
+		if (*read == '~')
+		{
+			++read;
+			if (*read == '0')
+			{
+				*write++ = '~';
+			}
+			else if (*read == '1')
+			{
+				*write++ = '/';
+			}
+			else
+			{
+				return 0;
+			}
+			++read;
+		}
+		else
+		{
+			*write++ = *read++;
+		}
+	}
+
+	*write = 0;
+	return 1;
+}
+
+static int cgltf_pointer_tokenize(const char* pointer, cgltf_pointer_token* out_tokens, int max_tokens, char* storage, cgltf_size storage_size)
+{
+	if (pointer[0] != '/')
+	{
+		return -1; /* empty pointer ("") and relative pointers are not valid targets */
+	}
+
+	int count = 0;
+	cgltf_size used = 0;
+	const char* cursor = pointer;
+
+	while (*cursor == '/')
+	{
+		++cursor;
+		const char* start = cursor;
+
+		while (*cursor && *cursor != '/')
+		{
+			++cursor;
+		}
+
+		cgltf_size raw_size = (cgltf_size)(cursor - start);
+
+		if (count >= max_tokens || used + raw_size + 1 > storage_size)
+		{
+			return -1;
+		}
+
+		memcpy(storage + used, start, raw_size);
+		storage[used + raw_size] = 0;
+
+		if (!cgltf_pointer_unescape(storage + used))
+		{
+			return -1;
+		}
+
+		out_tokens[count].data = storage + used;
+		out_tokens[count].size = strlen(storage + used);
+		++count;
+		used += raw_size + 1;
+	}
+
+	if (*cursor != 0)
+	{
+		return -1;
+	}
+
+	return count;
+}
+
+static int cgltf_pointer_token_eq(const cgltf_pointer_token* token, const char* str)
+{
+	return token->size == strlen(str) && strncmp(token->data, str, token->size) == 0;
+}
+
+/* Parses an array index reference token; returns -1 if it is not a valid index. */
+static int cgltf_pointer_token_index(const cgltf_pointer_token* token)
+{
+	if (token->size == 0)
+	{
+		return -1;
+	}
+
+	int index = 0;
+
+	for (cgltf_size i = 0; i < token->size; ++i)
+	{
+		char c = token->data[i];
+
+		if (c < '0' || c > '9')
+		{
+			return -1;
+		}
+
+		if (index > (0x7fffffff - (c - '0')) / 10)
+		{
+			return -1;
+		}
+
+		index = index * 10 + (c - '0');
+	}
+
+	return index;
+}
+
+static int cgltf_parse_json_animation_pointer_ext(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation_pointer* out_pointer)
+{
+	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+
+	int size = tokens[i].size;
+	++i;
+
+	for (int j = 0; j < size; ++j)
+	{
+		CGLTF_CHECK_KEY(tokens[i]);
+
+		if (cgltf_json_strcmp(tokens + i, json_chunk, "pointer") == 0)
+		{
+			i = cgltf_parse_json_string(options, tokens, i + 1, json_chunk, &out_pointer->pointer);
+		}
+		else
+		{
+			i = cgltf_skip_json(tokens, i + 1);
+		}
+
+		if (i < 0)
+		{
+			return i;
+		}
+	}
+
+	return i;
+}
+
 static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_animation_channel* out_channel)
 {
-	(void)options;
 	CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
 
 	int size = tokens[i].size;
@@ -6127,6 +6343,10 @@ static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t 
 					{
 						out_channel->target_path = cgltf_animation_path_type_weights;
 					}
+					else if (cgltf_json_strcmp(tokens+i, json_chunk, "pointer") == 0)
+					{
+						out_channel->target_path = cgltf_animation_path_type_pointer;
+					}
 					++i;
 				}
 				else if (cgltf_json_strcmp(tokens + i, json_chunk, "extras") == 0)
@@ -6135,7 +6355,43 @@ static int cgltf_parse_json_animation_channel(cgltf_options* options, jsmntok_t 
 				}
 				else if (cgltf_json_strcmp(tokens + i, json_chunk, "extensions") == 0)
 				{
-					i = cgltf_parse_json_unprocessed_extensions(options, tokens, i, json_chunk, &out_channel->extensions_count, &out_channel->extensions);
+					++i;
+
+					CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+					if (out_channel->extensions)
+					{
+						return CGLTF_ERROR_JSON;
+					}
+
+					int extensions_size = tokens[i].size;
+					out_channel->extensions_count = 0;
+					out_channel->extensions = (cgltf_extension*)cgltf_calloc(options, sizeof(cgltf_extension), extensions_size);
+
+					if (!out_channel->extensions)
+					{
+						return CGLTF_ERROR_NOMEM;
+					}
+
+					++i;
+					for (int m = 0; m < extensions_size; ++m)
+					{
+						CGLTF_CHECK_KEY(tokens[i]);
+
+						if (cgltf_json_strcmp(tokens + i, json_chunk, "KHR_animation_pointer") == 0)
+						{
+							out_channel->has_animation_pointer = 1;
+							i = cgltf_parse_json_animation_pointer_ext(options, tokens, i + 1, json_chunk, &out_channel->animation_pointer);
+						}
+						else
+						{
+							i = cgltf_parse_json_unprocessed_extension(options, tokens, i, json_chunk, &out_channel->extensions[out_channel->extensions_count++]);
+						}
+
+						if (i < 0)
+						{
+							return i;
+						}
+					}
 				}
 				else
 				{
@@ -6684,6 +6940,456 @@ cgltf_result cgltf_parse_json(cgltf_options* options, const uint8_t* json_chunk,
 	return cgltf_result_success;
 }
 
+#define CGLTF_POINTER_MAX_TOKENS 16
+
+/*
+ * Handles pointers rooted at /materials/{}/extensions/.
+ * `tokens` start at the extension name; returns 1 on success, 0 otherwise.
+ */
+static int cgltf_resolve_animation_pointer_material_extension(
+	const cgltf_material* material,
+	const cgltf_pointer_token* tokens, int token_count,
+	cgltf_animation_pointer* out_pointer)
+{
+	if (token_count < 2)
+	{
+		return 0;
+	}
+
+	const cgltf_pointer_token* prop = &tokens[1];
+
+	if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_clearcoat"))
+	{
+		if (!material->has_clearcoat)
+		{
+			return 0;
+		}
+		if (token_count == 2 &&
+			(cgltf_pointer_token_eq(prop, "clearcoatFactor") ||
+				cgltf_pointer_token_eq(prop, "clearcoatRoughness")))
+		{
+			return 1;
+		}
+		if (token_count == 3 && cgltf_pointer_token_eq(prop, "clearcoatNormalTexture") &&
+			cgltf_pointer_token_eq(&tokens[2], "scale"))
+		{
+			return material->clearcoat.clearcoat_normal_texture.texture != NULL;
+		}
+		return 0;
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_emissive_strength"))
+	{
+		return material->has_emissive_strength && token_count == 2 &&
+			cgltf_pointer_token_eq(prop, "emissiveStrength");
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_ior"))
+	{
+		return material->has_ior && token_count == 2 && cgltf_pointer_token_eq(prop, "ior");
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_iridescence"))
+	{
+		if (!material->has_iridescence || token_count != 2)
+		{
+			return 0;
+		}
+		return cgltf_pointer_token_eq(prop, "iridescenceFactor") ||
+			cgltf_pointer_token_eq(prop, "iridescenceIor") ||
+			cgltf_pointer_token_eq(prop, "iridescenceThicknessMinimum") ||
+			cgltf_pointer_token_eq(prop, "iridescenceThicknessMaximum");
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_sheen"))
+	{
+		if (!material->has_sheen)
+		{
+			return 0;
+		}
+		if (token_count == 2 && cgltf_pointer_token_eq(prop, "sheenRoughness"))
+		{
+			return 1;
+		}
+		if (token_count == 3 && cgltf_pointer_token_eq(prop, "sheenColorFactor"))
+		{
+			int component = cgltf_pointer_token_index(&tokens[2]);
+			if (component < 0 || component > 2)
+			{
+				return 0;
+			}
+			out_pointer->component_index = component;
+			return 1;
+		}
+		return 0;
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_specular"))
+	{
+		if (!material->has_specular)
+		{
+			return 0;
+		}
+		if (token_count == 2 && cgltf_pointer_token_eq(prop, "specularFactor"))
+		{
+			return 1;
+		}
+		if (token_count == 3 && cgltf_pointer_token_eq(prop, "specularColorFactor"))
+		{
+			int component = cgltf_pointer_token_index(&tokens[2]);
+			if (component < 0 || component > 2)
+			{
+				return 0;
+			}
+			out_pointer->component_index = component;
+			return 1;
+		}
+		return 0;
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_transmission"))
+	{
+		return material->has_transmission && token_count == 2 &&
+			cgltf_pointer_token_eq(prop, "transmissionFactor");
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_volume"))
+	{
+		if (!material->has_volume)
+		{
+			return 0;
+		}
+		if (token_count == 2 &&
+			(cgltf_pointer_token_eq(prop, "thicknessFactor") ||
+				cgltf_pointer_token_eq(prop, "attenuationDistance")))
+		{
+			return 1;
+		}
+		if (token_count == 3 && cgltf_pointer_token_eq(prop, "attenuationColor"))
+		{
+			int component = cgltf_pointer_token_index(&tokens[2]);
+			if (component < 0 || component > 2)
+			{
+				return 0;
+			}
+			out_pointer->component_index = component;
+			return 1;
+		}
+		return 0;
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_anisotropy"))
+	{
+		if (!material->has_anisotropy || token_count != 2)
+		{
+			return 0;
+		}
+		return cgltf_pointer_token_eq(prop, "anisotropyStrength") ||
+			cgltf_pointer_token_eq(prop, "anisotropyRotation");
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "KHR_materials_dispersion"))
+	{
+		return material->has_dispersion && token_count == 2 &&
+			cgltf_pointer_token_eq(prop, "dispersion");
+	}
+
+	return 0;
+}
+
+/*
+ * KHR_animation_pointer: resolves the parsed pointer string against the asset.
+ * On success fills target kind/object, expected accessor type and component index.
+ * Returns 0 on success, CGLTF_ERROR_JSON for malformed/unresolvable pointers,
+ * CGLTF_ERROR_NOMEM on allocation failure.
+ */
+#define CGLTF_POINTER_MAX_TOKENS 16
+
+static int cgltf_resolve_animation_pointer(cgltf_data* data, cgltf_animation_pointer* out_pointer)
+{
+	if (!out_pointer->pointer)
+	{
+		return CGLTF_ERROR_JSON;
+	}
+
+	/* Longest property path in the asset object model fits in this buffer. */
+	char storage[256];
+	cgltf_pointer_token tokens[CGLTF_POINTER_MAX_TOKENS];
+
+	int token_count = cgltf_pointer_tokenize(out_pointer->pointer, tokens, CGLTF_POINTER_MAX_TOKENS, storage, sizeof(storage));
+
+	if (token_count < 3)
+	{
+		return CGLTF_ERROR_JSON;
+	}
+
+	out_pointer->component_type = cgltf_type_scalar;
+	out_pointer->component_index = -1;
+
+	if (cgltf_pointer_token_eq(&tokens[0], "nodes"))
+	{
+		int node_index = cgltf_pointer_token_index(&tokens[1]);
+
+		if (node_index < 0 || (cgltf_size)node_index >= data->nodes_count)
+		{
+			return CGLTF_ERROR_JSON; /* points at a node that does not exist */
+		}
+
+		out_pointer->type = cgltf_animation_pointer_type_node;
+		out_pointer->node = &data->nodes[node_index];
+
+		if (token_count == 3 && cgltf_pointer_token_eq(&tokens[2], "translation"))
+		{
+			out_pointer->component_type = cgltf_type_vec3;
+		}
+		else if (token_count == 3 && cgltf_pointer_token_eq(&tokens[2], "rotation"))
+		{
+			out_pointer->component_type = cgltf_type_vec4;
+		}
+		else if (token_count == 3 && cgltf_pointer_token_eq(&tokens[2], "scale"))
+		{
+			out_pointer->component_type = cgltf_type_vec3;
+		}
+		else if (token_count == 4 && cgltf_pointer_token_eq(&tokens[2], "weights"))
+		{
+			int component = cgltf_pointer_token_index(&tokens[3]);
+			cgltf_node* node = &data->nodes[node_index];
+			/* When node weights are omitted the array length comes from the mesh targets. */
+			cgltf_size weights_count = node->weights_count;
+			if (weights_count == 0 && node->mesh && node->mesh->primitives_count)
+			{
+				weights_count = node->mesh->primitives[0].targets_count;
+			}
+
+			if (component < 0 || (cgltf_size)component >= weights_count)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			out_pointer->component_index = component;
+		}
+		else
+		{
+			return CGLTF_ERROR_JSON;
+		}
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "meshes"))
+	{
+		int mesh_index = cgltf_pointer_token_index(&tokens[1]);
+
+		if (mesh_index < 0 || (cgltf_size)mesh_index >= data->meshes_count)
+		{
+			return CGLTF_ERROR_JSON;
+		}
+
+		out_pointer->type = cgltf_animation_pointer_type_mesh;
+		out_pointer->mesh = &data->meshes[mesh_index];
+
+		if (!(token_count == 4 && cgltf_pointer_token_eq(&tokens[2], "weights")))
+		{
+			return CGLTF_ERROR_JSON;
+		}
+
+		int component = cgltf_pointer_token_index(&tokens[3]);
+		cgltf_mesh* mesh = &data->meshes[mesh_index];
+		cgltf_size weights_count = mesh->weights_count;
+		if (weights_count == 0 && mesh->primitives_count)
+		{
+			weights_count = mesh->primitives[0].targets_count;
+		}
+
+		if (component < 0 || (cgltf_size)component >= weights_count)
+		{
+			return CGLTF_ERROR_JSON;
+		}
+		out_pointer->component_index = component;
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "cameras"))
+	{
+		int camera_index = cgltf_pointer_token_index(&tokens[1]);
+
+		if (camera_index < 0 || (cgltf_size)camera_index >= data->cameras_count)
+		{
+			return CGLTF_ERROR_JSON;
+		}
+
+		cgltf_camera* camera = &data->cameras[camera_index];
+		out_pointer->type = cgltf_animation_pointer_type_camera;
+		out_pointer->camera = camera;
+
+		if (token_count != 4)
+		{
+			return CGLTF_ERROR_JSON;
+		}
+
+		if (camera->type == cgltf_camera_type_perspective && cgltf_pointer_token_eq(&tokens[2], "perspective"))
+		{
+			if (cgltf_pointer_token_eq(&tokens[3], "aspectRatio"))
+			{
+				if (!camera->data.perspective.has_aspect_ratio)
+				{
+					return CGLTF_ERROR_JSON; /* no default: must be present explicitly */
+				}
+			}
+			else if (cgltf_pointer_token_eq(&tokens[3], "zfar"))
+			{
+				if (!camera->data.perspective.has_zfar)
+				{
+					return CGLTF_ERROR_JSON;
+				}
+			}
+			else if (!cgltf_pointer_token_eq(&tokens[3], "yfov") && !cgltf_pointer_token_eq(&tokens[3], "znear"))
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else if (camera->type == cgltf_camera_type_orthographic && cgltf_pointer_token_eq(&tokens[2], "orthographic"))
+		{
+			if (!cgltf_pointer_token_eq(&tokens[3], "xmag") &&
+				!cgltf_pointer_token_eq(&tokens[3], "ymag") &&
+				!cgltf_pointer_token_eq(&tokens[3], "zfar") &&
+				!cgltf_pointer_token_eq(&tokens[3], "znear"))
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else
+		{
+			return CGLTF_ERROR_JSON;
+		}
+	}
+	else if (cgltf_pointer_token_eq(&tokens[0], "materials"))
+	{
+		int material_index = cgltf_pointer_token_index(&tokens[1]);
+
+		if (material_index < 0 || (cgltf_size)material_index >= data->materials_count)
+		{
+			return CGLTF_ERROR_JSON;
+		}
+
+		cgltf_material* material = &data->materials[material_index];
+		out_pointer->type = cgltf_animation_pointer_type_material;
+		out_pointer->material = material;
+
+		if (token_count == 3 && cgltf_pointer_token_eq(&tokens[2], "pbrMetallicRoughness"))
+		{
+			return CGLTF_ERROR_JSON; /* factor name missing */
+		}
+		else if (token_count == 4 && cgltf_pointer_token_eq(&tokens[2], "pbrMetallicRoughness"))
+		{
+			if (!material->has_pbr_metallic_roughness)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			if (cgltf_pointer_token_eq(&tokens[3], "metallicFactor") ||
+				cgltf_pointer_token_eq(&tokens[3], "roughnessFactor"))
+			{
+				/* factors have spec defaults */
+			}
+			else
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else if (token_count == 5 && cgltf_pointer_token_eq(&tokens[2], "pbrMetallicRoughness") &&
+			cgltf_pointer_token_eq(&tokens[3], "baseColorFactor"))
+		{
+			if (!material->has_pbr_metallic_roughness)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			int component = cgltf_pointer_token_index(&tokens[4]);
+			if (component < 0 || component > 3)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			out_pointer->component_index = component;
+		}
+		else if (token_count == 3 && cgltf_pointer_token_eq(&tokens[2], "alphaCutoff"))
+		{
+			/* has a spec default of 0.5 */
+		}
+		else if (token_count == 4 && cgltf_pointer_token_eq(&tokens[2], "normalTexture") &&
+			cgltf_pointer_token_eq(&tokens[3], "scale"))
+		{
+			if (!material->normal_texture.texture)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else if (token_count == 4 && cgltf_pointer_token_eq(&tokens[2], "occlusionTexture") &&
+			cgltf_pointer_token_eq(&tokens[3], "strength"))
+		{
+			if (!material->occlusion_texture.texture)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else if (token_count == 3 && cgltf_pointer_token_eq(&tokens[2], "emissiveFactor"))
+		{
+			return CGLTF_ERROR_JSON; /* array components need an index: /emissiveFactor/0..2 */
+		}
+		else if (token_count == 4 && cgltf_pointer_token_eq(&tokens[2], "emissiveFactor"))
+		{
+			int component = cgltf_pointer_token_index(&tokens[3]);
+			if (component < 0 || component > 2)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			out_pointer->component_index = component;
+		}
+		else if (token_count >= 4 && cgltf_pointer_token_eq(&tokens[2], "extensions"))
+		{
+			if (!cgltf_resolve_animation_pointer_material_extension(material, tokens + 3, token_count - 3, out_pointer))
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else
+		{
+			return CGLTF_ERROR_JSON;
+		}
+	}
+	else if ((token_count == 5 || token_count == 6) &&
+		cgltf_pointer_token_eq(&tokens[0], "extensions") &&
+		cgltf_pointer_token_eq(&tokens[1], "KHR_lights_punctual") &&
+		cgltf_pointer_token_eq(&tokens[2], "lights"))
+	{
+		int light_index = cgltf_pointer_token_index(&tokens[3]);
+
+		if (light_index < 0 || (cgltf_size)light_index >= data->lights_count)
+		{
+			return CGLTF_ERROR_JSON;
+		}
+
+		cgltf_light* light = &data->lights[light_index];
+		out_pointer->type = cgltf_animation_pointer_type_light;
+		out_pointer->light = light;
+
+		if (cgltf_pointer_token_eq(&tokens[4], "intensity") || cgltf_pointer_token_eq(&tokens[4], "range"))
+		{
+			if (token_count != 5)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+		}
+		else if (cgltf_pointer_token_eq(&tokens[4], "color"))
+		{
+			if (token_count != 6)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			int component = cgltf_pointer_token_index(&tokens[5]);
+			if (component < 0 || component > 2)
+			{
+				return CGLTF_ERROR_JSON;
+			}
+			out_pointer->component_index = component;
+		}
+		else
+		{
+			return CGLTF_ERROR_JSON;
+		}
+	}
+	else
+	{
+		return CGLTF_ERROR_JSON;
+	}
+
+	out_pointer->resolved = 1;
+	return 0;
+}
+
 static int cgltf_fixup_pointers(cgltf_data* data)
 {
 	for (cgltf_size i = 0; i < data->meshes_count; ++i)
@@ -6867,6 +7573,28 @@ static int cgltf_fixup_pointers(cgltf_data* data)
 		{
 			CGLTF_PTRFIXUP_REQ(data->animations[i].channels[j].sampler, data->animations[i].samplers, data->animations[i].samplers_count);
 			CGLTF_PTRFIXUP(data->animations[i].channels[j].target_node, data->nodes, data->nodes_count);
+
+			cgltf_animation_channel* channel = &data->animations[i].channels[j];
+
+			if (channel->has_animation_pointer)
+			{
+				/* KHR_animation_pointer: "node" MUST NOT be set and path must be "pointer". */
+				if (channel->target_node || channel->target_path != cgltf_animation_path_type_pointer)
+				{
+					return CGLTF_ERROR_JSON;
+				}
+
+				int resolve_result = cgltf_resolve_animation_pointer(data, &channel->animation_pointer);
+				if (resolve_result < 0)
+				{
+					return resolve_result;
+				}
+			}
+			else if (channel->target_path == cgltf_animation_path_type_pointer)
+			{
+				/* path "pointer" without the extension is malformed */
+				return CGLTF_ERROR_JSON;
+			}
 		}
 	}
 

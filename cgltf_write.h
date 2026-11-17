@@ -906,6 +906,8 @@ static const char* cgltf_write_str_path_type(cgltf_animation_path_type path_type
 		return "scale";
 	case cgltf_animation_path_type_weights:
 		return "weights";
+	case cgltf_animation_path_type_pointer:
+		return "pointer";
 	default:
 		break;
 	}
@@ -953,8 +955,20 @@ static void cgltf_write_animation_channel(cgltf_write_context* context, const cg
 	cgltf_write_line(context, "{");
 	CGLTF_WRITE_IDXPROP("sampler", animation_channel->sampler, animation->samplers);
 	cgltf_write_line(context, "\"target\": {");
-	CGLTF_WRITE_IDXPROP("node", animation_channel->target_node, context->data->nodes);
+	/* KHR_animation_pointer channels must not carry a "node" property. */
+	if (!animation_channel->has_animation_pointer)
+	{
+		CGLTF_WRITE_IDXPROP("node", animation_channel->target_node, context->data->nodes);
+	}
 	cgltf_write_path_type(context, "path", animation_channel->target_path);
+	if (animation_channel->has_animation_pointer)
+	{
+		cgltf_write_line(context, "\"extensions\": {");
+		cgltf_write_line(context, "\"KHR_animation_pointer\": {");
+		cgltf_write_strprop(context, "pointer", animation_channel->animation_pointer.pointer);
+		cgltf_write_line(context, "}");
+		cgltf_write_line(context, "}");
+	}
 	cgltf_write_line(context, "}");
 	cgltf_write_extras(context, &animation_channel->extras);
 	cgltf_write_line(context, "}");

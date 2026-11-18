@@ -128,6 +128,9 @@ typedef enum cgltf_result
 	cgltf_result_io_error,
 	cgltf_result_out_of_memory,
 	cgltf_result_legacy_gltf,
+	cgltf_result_lod_missing_ids, /* MSFT_lod extension is present but has no (or an empty) ids array */
+	cgltf_result_lod_cycle, /* MSFT_lod ids form a circular reference; rejected during parsing */
+	cgltf_result_lod_index_out_of_bounds, /* MSFT_lod ids refer to a node index that does not exist */
     cgltf_result_max_enum
 } cgltf_result;
 
@@ -709,6 +712,16 @@ struct cgltf_node {
 	cgltf_extras extras;
 	cgltf_bool has_mesh_gpu_instancing;
 	cgltf_mesh_gpu_instancing mesh_gpu_instancing;
+	/* MSFT_lod: lower LOD levels of this node in descending quality. The ids chain
+	   (each LOD node may itself carry MSFT_lod) is flattened into this array, so
+	   lods[k] is LOD level k+1 relative to this node. */
+	cgltf_node** lods;
+	cgltf_size lods_count;
+	/* MSFT_lod screen coverage thresholds parsed from extras.MSFT_screencoverage;
+	   entry k is the lower bound of the coverage range in which LOD level k
+	   (level 0 is this node itself) should be rendered. */
+	cgltf_float* screen_coverages;
+	cgltf_size screen_coverages_count;
 	cgltf_size extensions_count;
 	cgltf_extension* extensions;
 };
@@ -870,6 +883,13 @@ void cgltf_free(cgltf_data* data);
 
 void cgltf_node_transform_local(const cgltf_node* node, cgltf_float* out_matrix);
 void cgltf_node_transform_world(const cgltf_node* node, cgltf_float* out_matrix);
+
+/* MSFT_lod: picks the LOD node to render for a given screen coverage (0..1 fraction
+   of the screen covered by the object). Uses the screen coverage thresholds parsed
+   from extras.MSFT_screencoverage; the last threshold acts as a cull limit, so this
+   returns NULL when the coverage is below it (nothing should be rendered). Nodes
+   without LOD or threshold data are always returned as-is. */
+const cgltf_node* cgltf_node_pick_lod(const cgltf_node* node, cgltf_float screen_coverage);
 
 const uint8_t* cgltf_buffer_view_data(const cgltf_buffer_view* view);
 
@@ -2052,6 +2072,8 @@ void cgltf_free(cgltf_data* data)
 		data->memory.free_func(data->memory.user_data, data->nodes[i].name);
 		data->memory.free_func(data->memory.user_data, data->nodes[i].children);
 		data->memory.free_func(data->memory.user_data, data->nodes[i].weights);
+		data->memory.free_func(data->memory.user_data, data->nodes[i].lods);
+		data->memory.free_func(data->memory.user_data, data->nodes[i].screen_coverages);
 
 		if (data->nodes[i].has_mesh_gpu_instancing)
 		{
@@ -2177,6 +2199,50 @@ void cgltf_node_transform_local(const cgltf_node* node, cgltf_float* out_matrix)
 		lm[14] = tz;
 		lm[15] = 1.f;
 	}
+}
+
+const cgltf_node* cgltf_node_pick_lod(const cgltf_node* node, cgltf_float screen_coverage)
+{
+	if (node == NULL)
+	{
+		return NULL;
+	}
+
+	/* no LODs or no threshold data: render the node itself */
+	if (node->lods_count == 0 || node->screen_coverages_count == 0)
+	{
+		return node;
+	}
+
+	/* thresholds are the lower bounds of each level's coverage range, so the
+	   first satisfied threshold gives the highest-quality usable level */
+	cgltf_size level = 0;
+	for (; level < node->screen_coverages_count; ++level)
+	{
+		if (screen_coverage >= node->screen_coverages[level])
+		{
+			break;
+		}
+	}
+
+	if (level == node->screen_coverages_count)
+	{
+		return NULL; /* below the lowest threshold: render nothing */
+	}
+
+	if (level == 0)
+	{
+		return node;
+	}
+
+	/* lods is the flattened chain: lods[k] is LOD level k+1 */
+	cgltf_size lod_index = level - 1;
+	if (lod_index >= node->lods_count)
+	{
+		lod_index = node->lods_count - 1; /* more thresholds than levels: clamp to the lowest LOD */
+	}
+
+	return node->lods[lod_index];
 }
 
 void cgltf_node_transform_world(const cgltf_node* node, cgltf_float* out_matrix)
@@ -2746,6 +2812,9 @@ cgltf_size cgltf_accessor_unpack_indices(const cgltf_accessor* accessor, void* o
 #define CGLTF_ERROR_JSON -1
 #define CGLTF_ERROR_NOMEM -2
 #define CGLTF_ERROR_LEGACY -3
+#define CGLTF_ERROR_LOD_MISSING_IDS -4
+#define CGLTF_ERROR_LOD_CYCLE -5
+#define CGLTF_ERROR_LOD_BOUNDS -6
 
 #define CGLTF_CHECK_TOKTYPE(tok_, type_) if ((tok_).type != (type_)) { return CGLTF_ERROR_JSON; }
 #define CGLTF_CHECK_TOKTYPE_RET(tok_, type_, ret_) if ((tok_).type != (type_)) { return ret_; }
@@ -5831,6 +5900,47 @@ static int cgltf_parse_json_node(cgltf_options* options, jsmntok_t const* tokens
 		}
 		else if (cgltf_json_strcmp(tokens + i, json_chunk, "extras") == 0)
 		{
+			/* MSFT_lod stores the LOD switching thresholds in extras.MSFT_screencoverage;
+			   scan for them here while still preserving the raw extras below. */
+			if (tokens[i + 1].type == JSMN_OBJECT)
+			{
+				int extras_size = tokens[i + 1].size;
+				int scan = i + 2;
+
+				for (int k = 0; k < extras_size; ++k)
+				{
+					if (tokens[scan].type == JSMN_STRING &&
+						cgltf_json_strcmp(tokens + scan, json_chunk, "MSFT_screencoverage") == 0 &&
+						tokens[scan + 1].type == JSMN_ARRAY)
+					{
+						cgltf_size sc_count = (cgltf_size)tokens[scan + 1].size;
+						cgltf_float* sc = (cgltf_float*)cgltf_calloc(options, sizeof(cgltf_float), sc_count);
+						if (!sc)
+						{
+							return CGLTF_ERROR_NOMEM;
+						}
+
+						int r = cgltf_parse_json_float_array(tokens, scan + 1, json_chunk, sc, (int)sc_count);
+						if (r < 0)
+						{
+							options->memory.free_func(options->memory.user_data, sc);
+							return r;
+						}
+
+						out_node->screen_coverages = sc;
+						out_node->screen_coverages_count = sc_count;
+						break;
+					}
+
+					/* keys are plain strings, so skipping the value advances to the next key */
+					scan = cgltf_skip_json(tokens, scan + 1);
+					if (scan < 0)
+					{
+						return CGLTF_ERROR_JSON;
+					}
+				}
+			}
+
 			i = cgltf_parse_json_extras(options, tokens, i + 1, json_chunk, &out_node->extras);
 		}
 		else if (cgltf_json_strcmp(tokens + i, json_chunk, "extensions") == 0)
@@ -5893,6 +6003,53 @@ static int cgltf_parse_json_node(cgltf_options* options, jsmntok_t const* tokens
 				{
 					out_node->has_mesh_gpu_instancing = 1;
 					i = cgltf_parse_json_mesh_gpu_instancing(options, tokens, i + 1, json_chunk, &out_node->mesh_gpu_instancing);
+				}
+				else if (cgltf_json_strcmp(tokens + i, json_chunk, "MSFT_lod") == 0)
+				{
+					cgltf_bool has_ids = 0;
+
+					++i;
+
+					CGLTF_CHECK_TOKTYPE(tokens[i], JSMN_OBJECT);
+
+					int data_size = tokens[i].size;
+					++i;
+
+					for (int m = 0; m < data_size; ++m)
+					{
+						CGLTF_CHECK_KEY(tokens[i]);
+
+						if (cgltf_json_strcmp(tokens + i, json_chunk, "ids") == 0)
+						{
+							has_ids = 1;
+
+							i = cgltf_parse_json_array(options, tokens, i + 1, json_chunk, sizeof(cgltf_node*), (void**)&out_node->lods, &out_node->lods_count);
+							if (i < 0)
+							{
+								return i;
+							}
+
+							for (cgltf_size k = 0; k < out_node->lods_count; ++k)
+							{
+								out_node->lods[k] = CGLTF_PTRINDEX(cgltf_node, cgltf_json_to_int(tokens + i, json_chunk));
+								++i;
+							}
+						}
+						else
+						{
+							i = cgltf_skip_json(tokens, i + 1);
+						}
+
+						if (i < 0)
+						{
+							return i;
+						}
+					}
+
+					if (!has_ids || out_node->lods_count == 0)
+					{
+						return CGLTF_ERROR_LOD_MISSING_IDS;
+					}
 				}
 				else
 				{
@@ -6413,6 +6570,7 @@ cgltf_size cgltf_calc_size(cgltf_type type, cgltf_component_type component_type)
 }
 
 static int cgltf_fixup_pointers(cgltf_data* out_data);
+static int cgltf_resolve_lods(cgltf_options* options, cgltf_data* data);
 
 static int cgltf_parse_json_root(cgltf_options* options, jsmntok_t const* tokens, int i, const uint8_t* json_chunk, cgltf_data* out_data)
 {
@@ -6666,14 +6824,29 @@ cgltf_result cgltf_parse_json(cgltf_options* options, const uint8_t* json_chunk,
 		{
 		case CGLTF_ERROR_NOMEM: return cgltf_result_out_of_memory;
 		case CGLTF_ERROR_LEGACY: return cgltf_result_legacy_gltf;
+		case CGLTF_ERROR_LOD_MISSING_IDS: return cgltf_result_lod_missing_ids;
 		default: return cgltf_result_invalid_gltf;
 		}
 	}
 
-	if (cgltf_fixup_pointers(data) < 0)
+	int fixup_result = cgltf_fixup_pointers(data);
+	if (fixup_result < 0)
 	{
 		cgltf_free(data);
-		return cgltf_result_invalid_gltf;
+		return fixup_result == CGLTF_ERROR_LOD_BOUNDS ? cgltf_result_lod_index_out_of_bounds : cgltf_result_invalid_gltf;
+	}
+
+	int lod_result = cgltf_resolve_lods(options, data);
+	if (lod_result < 0)
+	{
+		cgltf_free(data);
+
+		switch (lod_result)
+		{
+		case CGLTF_ERROR_NOMEM: return cgltf_result_out_of_memory;
+		case CGLTF_ERROR_LOD_CYCLE: return cgltf_result_lod_cycle;
+		default: return cgltf_result_invalid_gltf;
+		}
 	}
 
 	data->json = (const char*)json_chunk;
@@ -6831,6 +7004,16 @@ static int cgltf_fixup_pointers(cgltf_data* data)
 		CGLTF_PTRFIXUP(data->nodes[i].camera, data->cameras, data->cameras_count);
 		CGLTF_PTRFIXUP(data->nodes[i].light, data->lights, data->lights_count);
 
+		for (cgltf_size j = 0; j < data->nodes[i].lods_count; ++j)
+		{
+			cgltf_size lod_index = (cgltf_size)data->nodes[i].lods[j];
+			if (lod_index == 0 || lod_index > data->nodes_count)
+			{
+				return CGLTF_ERROR_LOD_BOUNDS;
+			}
+			data->nodes[i].lods[j] = &data->nodes[lod_index - 1];
+		}
+
 		if (data->nodes[i].has_mesh_gpu_instancing)
 		{
 			for (cgltf_size m = 0; m < data->nodes[i].mesh_gpu_instancing.attributes_count; ++m)
@@ -6871,6 +7054,179 @@ static int cgltf_fixup_pointers(cgltf_data* data)
 	}
 
 	return 0;
+}
+
+/* Validates the MSFT_lod ids graph and flattens each node's LOD chain (level order)
+   into its lods array, so that lods[k] is always LOD level k+1 of that node.
+   Circular references are rejected here, at parse time, so consumers can walk the
+   flattened arrays without any cycle checks. */
+static int cgltf_resolve_lods(cgltf_options* options, cgltf_data* data)
+{
+	cgltf_size nodes_count = data->nodes_count;
+	cgltf_bool has_any_lods = 0;
+
+	for (cgltf_size i = 0; i < nodes_count; ++i)
+	{
+		if (data->nodes[i].lods_count > 0)
+		{
+			has_any_lods = 1;
+			break;
+		}
+	}
+
+	if (!has_any_lods)
+	{
+		return 0;
+	}
+
+	int result = 0;
+
+	unsigned char* state = (unsigned char*)cgltf_calloc(options, 1, nodes_count);
+	cgltf_size* stack = (cgltf_size*)cgltf_calloc(options, sizeof(cgltf_size), nodes_count);
+	cgltf_size* child_iter = (cgltf_size*)cgltf_calloc(options, sizeof(cgltf_size), nodes_count);
+	cgltf_size* mark = (cgltf_size*)cgltf_calloc(options, sizeof(cgltf_size), nodes_count);
+	cgltf_node** order = (cgltf_node**)cgltf_calloc(options, sizeof(cgltf_node*), nodes_count);
+	cgltf_node** queue = (cgltf_node**)cgltf_calloc(options, sizeof(cgltf_node*), nodes_count);
+	cgltf_node*** flattened = (cgltf_node***)cgltf_calloc(options, sizeof(cgltf_node**), nodes_count);
+	cgltf_size* flattened_count = (cgltf_size*)cgltf_calloc(options, sizeof(cgltf_size), nodes_count);
+
+	if (!state || !stack || !child_iter || !mark || !order || !queue || !flattened || !flattened_count)
+	{
+		result = CGLTF_ERROR_NOMEM;
+		goto cleanup;
+	}
+
+	/* phase 1: reject circular LOD references (iterative 3-color DFS over the ids graph) */
+	for (cgltf_size root = 0; root < nodes_count; ++root)
+	{
+		if (state[root] != 0 || data->nodes[root].lods_count == 0)
+		{
+			continue;
+		}
+
+		cgltf_size depth = 0;
+		stack[depth] = root;
+		child_iter[depth] = 0;
+		state[root] = 1;
+		++depth;
+
+		while (depth > 0)
+		{
+			cgltf_node* top = &data->nodes[stack[depth - 1]];
+			cgltf_size* it = &child_iter[depth - 1];
+
+			if (*it < top->lods_count)
+			{
+				cgltf_size child = (cgltf_size)(top->lods[*it] - data->nodes);
+				++(*it);
+
+				if (state[child] == 1)
+				{
+					result = CGLTF_ERROR_LOD_CYCLE;
+					goto cleanup;
+				}
+
+				if (state[child] == 0)
+				{
+					state[child] = 1;
+					stack[depth] = child;
+					child_iter[depth] = 0;
+					++depth;
+				}
+			}
+			else
+			{
+				state[stack[depth - 1]] = 2;
+				--depth;
+			}
+		}
+	}
+
+	/* phase 2: flatten each node's LOD chain (BFS over the ids graph, level order) */
+	for (cgltf_size v = 0; v < nodes_count; ++v)
+	{
+		cgltf_node* node = &data->nodes[v];
+
+		if (node->lods_count == 0)
+		{
+			continue;
+		}
+
+		cgltf_size count = 0;
+		cgltf_size head = 0;
+		cgltf_size tail = 0;
+		cgltf_size stamp = v + 1;
+
+		mark[v] = stamp; /* never re-enqueue the starting node */
+
+		for (cgltf_size k = 0; k < node->lods_count; ++k)
+		{
+			cgltf_size idx = (cgltf_size)(node->lods[k] - data->nodes);
+			if (mark[idx] != stamp)
+			{
+				mark[idx] = stamp;
+				queue[tail++] = node->lods[k];
+			}
+		}
+
+		while (head < tail)
+		{
+			cgltf_node* n = queue[head++];
+			order[count++] = n;
+
+			for (cgltf_size k = 0; k < n->lods_count; ++k)
+			{
+				cgltf_size idx = (cgltf_size)(n->lods[k] - data->nodes);
+				if (mark[idx] != stamp)
+				{
+					mark[idx] = stamp;
+					queue[tail++] = n->lods[k];
+				}
+			}
+		}
+
+		flattened[v] = (cgltf_node**)cgltf_calloc(options, sizeof(cgltf_node*), count);
+		if (!flattened[v])
+		{
+			result = CGLTF_ERROR_NOMEM;
+			goto cleanup;
+		}
+
+		memcpy(flattened[v], order, count * sizeof(cgltf_node*));
+		flattened_count[v] = count;
+	}
+
+	/* phase 3: replace the as-authored ids arrays with the flattened chains */
+	for (cgltf_size v = 0; v < nodes_count; ++v)
+	{
+		if (flattened[v])
+		{
+			options->memory.free_func(options->memory.user_data, data->nodes[v].lods);
+			data->nodes[v].lods = flattened[v];
+			data->nodes[v].lods_count = flattened_count[v];
+			flattened[v] = NULL;
+		}
+	}
+
+cleanup:
+	if (flattened)
+	{
+		for (cgltf_size v = 0; v < nodes_count; ++v)
+		{
+			options->memory.free_func(options->memory.user_data, flattened[v]);
+		}
+	}
+
+	options->memory.free_func(options->memory.user_data, flattened);
+	options->memory.free_func(options->memory.user_data, flattened_count);
+	options->memory.free_func(options->memory.user_data, queue);
+	options->memory.free_func(options->memory.user_data, order);
+	options->memory.free_func(options->memory.user_data, mark);
+	options->memory.free_func(options->memory.user_data, child_iter);
+	options->memory.free_func(options->memory.user_data, stack);
+	options->memory.free_func(options->memory.user_data, state);
+
+	return result;
 }
 
 /*

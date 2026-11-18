@@ -1,0 +1,13 @@
+/home/gyr/feedback/uid24547/build/CMakeFiles/cgltf_test.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/test_conversion.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/test_write.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/test_write_glb.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/test_math.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/test_strings.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/test_msft_lod.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/edit_cache.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/rebuild_cache.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/list_install_components.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/install.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/install/local.dir
+/home/gyr/feedback/uid24547/build/CMakeFiles/install/strip.dir

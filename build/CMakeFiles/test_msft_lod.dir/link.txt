@@ -1,0 +1,1 @@
+/usr/bin/cc -g -fsanitize=address -Wl,--dependency-file=CMakeFiles/test_msft_lod.dir/link.d CMakeFiles/test_msft_lod.dir/test_msft_lod.c.o -o test_msft_lod
